@@ -1,15 +1,23 @@
----
-name: Binance Square Auto Post
+name: Binance Square Auto Post x15
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 8 * * *"
-    - cron: "30 11 * * *"
-    - cron: "30 14 * * *"
-    - cron: "30 17 * * *"
-    - cron: "30 20 * * *"
+    - cron: "30 3 * * *"
+    - cron: "0 5 * * *"
+    - cron: "30 6 * * *"
+    - cron: "0 8 * * *"
+    - cron: "30 9 * * *"
+    - cron: "0 11 * * *"
+    - cron: "30 12 * * *"
+    - cron: "0 14 * * *"
+    - cron: "30 15 * * *"
+    - cron: "0 17 * * *"
+    - cron: "30 18 * * *"
+    - cron: "0 20 * * *"
+    - cron: "30 21 * * *"
     - cron: "0 23 * * *"
+    - cron: "30 0 * * *"
 
 permissions:
   contents: read
@@ -25,7 +33,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Generate Binance Square post with Gemini
         env:
@@ -36,45 +44,150 @@ jobs:
           cat > generate.mjs <<'EOF'
           const geminiKey = process.env.GEMINI_API_KEY;
           const squareKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
+          const geminiModel = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
           if (!geminiKey) throw new Error("GEMINI_API_KEY secret missing");
           if (!squareKey) throw new Error("BINANCE_SQUARE_OPENAPI_KEY secret missing");
 
-          const prompt = `You are a Binance Square crypto market commentator.
-          Write ONE short market insight post (under 280 chars) for retail crypto traders.
-          Focus: factual, neutral, no financial advice.
-          Pick one of: BTC, ETH, BNB, SOL. Use 1-3 hashtags only.`;
+          // ---------- 1) LIVE MARKET DATA (no keys needed) ----------
+          let marketBlock = "";
+          try {
+            const binanceRes = await fetch("https://api.binance.com/api/v3/ticker/24hr");
+            if (!binanceRes.ok) throw new Error("binance " + binanceRes.status);
+            const all = await binanceRes.json();
 
-          const geminiUrl =
-            "https://generativelanguage.googleapis.com/v1beta/" +
-            "models/gemini-3.8-flash:generateContent?key=" +
-            encodeURIComponent(geminiKey);
+            const rows = all
+              .filter(t => t.symbol.endsWith("USDT"))
+              .filter(t => !/(UP|DOWN|BULL|BEAR)USDT$/.test(t.symbol))
+              .filter(t => !/^(USDC|FDUSD|TUSD|BUSD|EUR|DAI)USDT$/.test(t.symbol))
+              .filter(t => parseFloat(t.quoteVolume) > 5000000)
+              .map(t => ({
+                symbol: t.symbol.replace(/USDT$/, ""),
+                price: parseFloat(t.lastPrice),
+                pct: parseFloat(t.priceChangePercent),
+                volM: Math.round(parseFloat(t.quoteVolume) / 1000000),
+              }));
 
-          const geminiRes = await fetch(geminiUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { temperature: 0.7, maxOutputTokens: 256 },
-            }),
-          });
+            const gainers = [...rows].sort((a, b) => b.pct - a.pct).slice(0, 6);
+            const volumes = [...rows].sort((a, b) => b.volM - a.volM).slice(0, 10);
+            const majors = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
+              .map(s => rows.find(r => r.symbol === s))
+              .filter(Boolean);
 
-          if (!geminiRes.ok) {
-            throw new Error("Gemini API failed: " + geminiRes.status +
-              " " + (await geminiRes.text()));
+            const fmt = r =>
+              `${r.symbol} $${r.price >= 1 ? r.price.toFixed(2) : r.price.toPrecision(4)} ` +
+              `(${r.pct >= 0 ? "+" : ""}${r.pct.toFixed(2)}% 24h, vol $${r.volM}M)`;
+
+            marketBlock +=
+              "MAJOR COINS (live): " + majors.map(fmt).join(" | ") + "\n" +
+              "TOP 24h GAINERS (live): " + gainers.map(fmt).join(" | ") + "\n" +
+              "HIGHEST VOLUME (live): " + volumes.map(r => r.symbol + " $" + r.volM + "M").join(", ");
+
+            try {
+              const cgRes = await fetch("https://api.coingecko.com/api/v3/search/trending");
+              if (cgRes.ok) {
+                const cg = await cgRes.json();
+                const trending = (cg.coins || [])
+                  .slice(0, 8)
+                  .map(c => c.item?.symbol || c.item?.name)
+                  .filter(Boolean);
+                if (trending.length) {
+                  marketBlock += "\nCOINGECKO TRENDING SEARCHES (live): " + trending.join(", ");
+                }
+              }
+            } catch (e) {
+              console.log("CoinGecko trending skipped: " + e.message);
+            }
+          } catch (e) {
+            marketBlock = "LIVE DATA UNAVAILABLE: " + e.message +
+              " - write a general, number-free observation instead. DO NOT invent any price or percentage.";
           }
-          const geminiData = await geminiRes.json();
-          const content =
-            geminiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
 
-          if (!content) {
-            throw new Error("Gemini returned empty content: " +
-              JSON.stringify(geminiData));
+          // ---------- 2) UNIQUENESS ENGINE (time-seeded rotation) ----------
+          const seed = Math.floor(Date.now() / 1000);
+          const angles = [
+            "momentum and 24h price action check",
+            "volume and liquidity angle",
+            "overall market sentiment read (fear vs greed tone)",
+            "key psychological price levels to watch",
+            "short news-style market brief tone",
+            "retail trader positioning and risk-management angle",
+            "weekend vs weekday flow observation",
+          ];
+          const hooks = [
+            "Quick market scan:",
+            "Watching the tape:",
+            "Today's read:",
+            "Market radar:",
+            "Chart chatter:",
+            "On the feed:",
+            "Volume check:",
+          ];
+          const tagPool = ["#BTC", "#ETH", "#BNB", "#SOL", "#Crypto", "#Altcoins",
+            "#MarketUpdate", "#CryptoNews", "#Trading", "#BinanceSquare"];
+          const angle = angles[seed % angles.length];
+          const hook = hooks[(seed >> 2) % hooks.length];
+          const shuffledTags = [...tagPool].sort(() => 0.5 - (seed % 100) / 100);
+          const tags = shuffledTags.slice(0, 2 + (seed % 2)).join(" ");
+          const focusHint = (seed >> 3) % 3; // 0 majors, 1 gainers, 2 trending
+
+          const focusLine =
+            focusHint === 0 ? "Lead the post around one of the MAJOR COINS."
+            : focusHint === 1 ? "Lead the post around one of the TOP 24h GAINERS."
+            : "Lead the post around a COINGECKO TRENDING coin if listed, otherwise a MAJOR COIN.";
+
+          // ---------- 3) GEMINI GENERATION ----------
+          const prompt =
+            `You are a Binance Square crypto market commentator.\n` +
+            `Write ONE short market insight post (max 260 characters) for retail crypto traders.\n` +
+            `Hook to start with: "${hook}"\n` +
+            `Angle: ${angle}.\n` +
+            `${focusLine}\n` +
+            `STRICT RULES:\n` +
+            `- Use ONLY the live numbers given below. NEVER invent or round a price or percentage. If no live number fits, write without numbers.\n` +
+            `- Factual, neutral tone. No financial advice, no buy/sell calls, no "get in" language.\n` +
+            `- Unique voice, varied sentence structure, ends with exactly these hashtags: ${tags}\n` +
+            `- Under 260 characters total.\n\n` +
+            `LIVE MARKET DATA:\n${marketBlock}`;
+
+          async function callGemini(p) {
+            const url =
+              "https://generativelanguage.googleapis.com/v1beta/models/" +
+              geminiModel + ":generateContent?key=" + encodeURIComponent(geminiKey);
+            const res = await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: p }] }],
+                generationConfig: { temperature: 1.0, maxOutputTokens: 300 },
+              }),
+            });
+            if (!res.ok) {
+              throw new Error("Gemini API failed: " + res.status + " " + (await res.text()));
+            }
+            const data = await res.json();
+            return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
           }
 
-          console.log("=== Generated post ===");
+          let content = await callGemini(prompt);
+          let attempt = 1;
+          while ((!content || content.length > 280) && attempt < 3) {
+            attempt += 1;
+            console.log("Retry #" + attempt + " (length=" + (content?.length ?? 0) + ")");
+            content = await callGemini(
+              prompt + `\n\nRETRY: previous output was ${content ? "too long" : "empty"}. ` +
+              `Output must be a single post under 260 characters.`
+            );
+          }
+          if (!content) throw new Error("Gemini returned empty content after retries");
+          if (content.length > 280) {
+            content = content.slice(0, 277).trimEnd() + "...";
+          }
+
+          console.log("=== Generated post (angle: " + angle + ") ===");
           console.log(content);
 
+          // ---------- 4) POST TO BINANCE SQUARE ----------
           const squareUrl =
             "https://www.binance.com/bapi/composite/v1/public/pgc/" +
             "openApi/content/add";
