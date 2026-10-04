@@ -35,6 +35,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Install chart renderer
+        run: npm install sharp --no-fund --no-audit
+
       - name: Generate Binance Square post with Gemini
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -42,169 +45,284 @@ jobs:
         run: |
           node --version
           cat > generate.mjs <<'EOF'
-          const geminiKey = process.env.GEMINI_API_KEY;
+          import sharp from "sharp";
+          import fs from "fs";
+
           const squareKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
+          const geminiKey = process.env.GEMINI_API_KEY || "";
           const geminiModel = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+          const DRY = process.env.DRY_RUN === "1";
 
-          if (!geminiKey) throw new Error("GEMINI_API_KEY secret missing");
-          if (!squareKey) throw new Error("BINANCE_SQUARE_OPENAPI_KEY secret missing");
+          if (!DRY && !squareKey) throw new Error("BINANCE_SQUARE_OPENAPI_KEY secret missing");
 
-          // ---------- 1) LIVE MARKET DATA (no keys needed) ----------
-          let marketBlock = "";
-          try {
-            const binanceRes = await fetch("https://api.binance.com/api/v3/ticker/24hr");
-            if (!binanceRes.ok) throw new Error("binance " + binanceRes.status);
-            const all = await binanceRes.json();
+          const SQUARE_BASE = "https://www.binance.com/bapi/composite";
+          const H = () => ({
+            "Content-Type": "application/json",
+            "X-Square-OpenAPI-Key": squareKey,
+            "clienttype": "binanceSkill",
+          });
+          const sleep = (ms) => new Promise((s) => setTimeout(s, ms));
 
-            const rows = all
-              .filter(t => t.symbol.endsWith("USDT"))
-              .filter(t => !/(UP|DOWN|BULL|BEAR)USDT$/.test(t.symbol))
-              .filter(t => !/^(USDC|FDUSD|TUSD|BUSD|EUR|DAI)USDT$/.test(t.symbol))
-              .filter(t => parseFloat(t.quoteVolume) > 5000000)
-              .map(t => ({
-                symbol: t.symbol.replace(/USDT$/, ""),
-                price: parseFloat(t.lastPrice),
-                pct: parseFloat(t.priceChangePercent),
-                volM: Math.round(parseFloat(t.quoteVolume) / 1000000),
-              }));
+          // ---------- helpers ----------
+          function mulberry32(a) {
+            return function () {
+              a |= 0; a = (a + 0x6d2b79f5) | 0;
+              let t = Math.imul(a ^ (a >>> 15), 1 | a);
+              t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+              return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+          }
+          function shuffle(arr, rng) {
+            const a = [...arr];
+            for (let i = a.length - 1; i > 0; i--) {
+              const j = Math.floor(rng() * (i + 1));
+              [a[i], a[j]] = [a[j], a[i]];
+            }
+            return a;
+          }
+          const dpFor = (p) => (p >= 100 ? 2 : p >= 1 ? 4 : p >= 0.01 ? 6 : 8);
+          const rnd = (v, dp) => Number(v.toFixed(dp));
+          const fmt = (v, dp) => v.toFixed(dp);
 
-            const gainers = [...rows].sort((a, b) => b.pct - a.pct).slice(0, 6);
-            const volumes = [...rows].sort((a, b) => b.volM - a.volM).slice(0, 10);
-            const majors = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
-              .map(s => rows.find(r => r.symbol === s))
-              .filter(Boolean);
+          const slot = Math.floor(Date.now() / (1000 * 60 * 30));
+          const rng = mulberry32(slot * 7 + 13);
 
-            const fmt = r =>
-              `${r.symbol} $${r.price >= 1 ? r.price.toFixed(2) : r.price.toPrecision(4)} ` +
-              `(${r.pct >= 0 ? "+" : ""}${r.pct.toFixed(2)}% 24h, vol $${r.volM}M)`;
+          // ---------- 1) LIVE MARKET DATA: pick 3 trending coins ----------
+          const MD = "https://data-api.binance.vision/api/v3";
+          const binanceRes = await fetch(MD + "/ticker/24hr");
+          if (!binanceRes.ok) throw new Error("Binance ticker failed: " + binanceRes.status);
+          const all = await binanceRes.json();
 
-            marketBlock +=
-              "MAJOR COINS (live): " + majors.map(fmt).join(" | ") + "\n" +
-              "TOP 24h GAINERS (live): " + gainers.map(fmt).join(" | ") + "\n" +
-              "HIGHEST VOLUME (live): " + volumes.map(r => r.symbol + " $" + r.volM + "M").join(", ");
+          const rows = all
+            .filter((t) => t.symbol.endsWith("USDT"))
+            .filter((t) => !/(UP|DOWN|BULL|BEAR)USDT$/.test(t.symbol))
+            .filter((t) => !/^(USDC|FDUSD|TUSD|BUSD|EUR|DAI|USDP|AEUR)USDT$/.test(t.symbol))
+            .filter((t) => parseFloat(t.quoteVolume) > 10000000)
+            .map((t) => ({
+              symbol: t.symbol.replace(/USDT$/, ""),
+              price: parseFloat(t.lastPrice),
+              pct: parseFloat(t.priceChangePercent),
+              volM: Math.round(parseFloat(t.quoteVolume) / 1000000),
+              high24: parseFloat(t.highPrice),
+              low24: parseFloat(t.lowPrice),
+            }));
 
+          const movers = [...rows]
+            .sort((a, b) => Math.abs(b.pct) - Math.abs(a.pct))
+            .slice(0, 40);
+          if (movers.length < 3) throw new Error("Not enough liquid movers found");
+
+          const picks = shuffle(movers, rng).slice(0, 3);
+          console.log("Picked coins:", picks.map((p) => p.symbol + " " + p.pct + "%").join(", "));
+
+          // ---------- 2) LEVELS FROM REAL PRICE STRUCTURE ----------
+          async function buildSetup(coin) {
+            const kRes = await fetch(
+              MD + "/klines?symbol=" + coin.symbol + "USDT&interval=1h&limit=30"
+            );
+            if (!kRes.ok) throw new Error("Klines failed for " + coin.symbol + ": " + kRes.status);
+            const k = await kRes.json();
+
+            const candles = k.slice(-24).map((c) => ({
+              open: parseFloat(c[1]), high: parseFloat(c[2]),
+              low: parseFloat(c[3]), close: parseFloat(c[4]),
+            }));
+            const swingLow = Math.min(...candles.map((c) => c.low));
+            const swingHigh = Math.max(...candles.map((c) => c.high));
+
+            const entry = coin.price;
+            const isLong = coin.pct >= 0;
+            let sl;
+
+            if (isLong) {
+              sl = swingLow * 0.995;
+              if ((entry - sl) / entry < 0.005) sl = entry * 0.985;
+              if (sl >= entry) sl = entry * 0.97;
+            } else {
+              sl = swingHigh * 1.005;
+              if ((sl - entry) / entry < 0.005) sl = entry * 1.015;
+              if (sl <= entry) sl = entry * 1.03;
+            }
+            const risk = Math.abs(entry - sl);
+            const mult = isLong ? [1, 2, 3] : [-1, -2, -3];
+            const tps = mult.map((m) => entry + m * risk);
+
+            const dp = dpFor(entry);
+            const setup = { ...coin, isLong, candles,
+              entry: rnd(entry, dp), sl: rnd(sl, dp),
+              tp: tps.map((t) => rnd(t, dp)), dp };
+
+            const ordered = setup.isLong
+              ? setup.sl < setup.entry && setup.tp[0] < setup.tp[1] && setup.tp[1] < setup.tp[2]
+              : setup.sl > setup.entry && setup.tp[0] > setup.tp[1] && setup.tp[1] > setup.tp[2];
+            if (!ordered) throw new Error("Level ordering broken for " + setup.symbol);
+            return setup;
+          }
+
+          const setups = [];
+          for (const coin of picks) setups.push(await buildSetup(coin));
+          console.log("Setups built:", setups.map((s) => s.symbol + (s.isLong ? " LONG" : " SHORT")).join(", "));
+
+          // ---------- 3) CHART IMAGE PER COIN ----------
+          function chartSVG(s) {
+            const W = 820, Hh = 540, X0 = 50, X1 = 640, Y0 = 90, Y1 = 470;
+            const lvls = [s.entry, s.sl, ...s.tp];
+            const hi = Math.max(...s.candles.map((c) => c.high), ...lvls) * 1.002;
+            const lo = Math.min(...s.candles.map((c) => c.low), ...lvls) * 0.998;
+            const y = (p) => Y0 + ((hi - p) / (hi - lo)) * (Y1 - Y0);
+            const n = s.candles.length, cw = (X1 - X0) / n;
+
+            let g = "";
+            for (let i = 0; i <= 4; i++) {
+              const gy = Y0 + ((Y1 - Y0) * i) / 4;
+              g += `<line x1="${X0}" y1="${gy}" x2="${X1}" y2="${gy}" stroke="#1e2329" stroke-width="1"/>`;
+            }
+            s.candles.forEach((c, i) => {
+              const cx = X0 + cw * i + cw / 2;
+              const up = c.close >= c.open;
+              const col = up ? "#0ecb81" : "#f6465d";
+              const yo = y(c.open), yc = y(c.close);
+              g += `<line x1="${cx}" y1="${y(c.high)}" x2="${cx}" y2="${y(c.low)}" stroke="${col}" stroke-width="1.5"/>`;
+              g += `<rect x="${cx - cw * 0.3}" y="${Math.min(yo, yc)}" width="${cw * 0.6}" height="${Math.max(1, Math.abs(yc - yo))}" fill="${col}"/>`;
+            });
+
+            const line = (p, col, label, dash) =>
+              `<line x1="${X0}" y1="${y(p)}" x2="770" y2="${y(p)}" stroke="${col}" stroke-width="1.6" stroke-dasharray="${dash}"/>` +
+              `<text x="676" y="${y(p) - 5}" font-size="15" font-weight="bold" fill="${col}">${label} ${fmt(p, s.dp)}</text>`;
+
+            const dir = s.isLong ? "LONG" : "SHORT";
+            return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${Hh}">` +
+              `<rect width="${W}" height="${Hh}" fill="#0b0e11"/>` +
+              `<text x="30" y="42" font-size="24" font-weight="bold" fill="#eaecef" font-family="DejaVu Sans, sans-serif">${s.symbol}/USDT ${dir} Setup</text>` +
+              `<text x="30" y="68" font-size="16" fill="#848e9c" font-family="DejaVu Sans, sans-serif">1H candles | 24h ${s.pct >= 0 ? "+" : ""}${s.pct.toFixed(2)}% | Vol $${s.volM}M | Binance Spot</text>` +
+              g +
+              line(s.sl, "#f6465d", "SL", "6 4") +
+              line(s.tp[0], "#0ecb81", "TP1", "6 4") +
+              line(s.tp[1], "#0ecb81", "TP2", "6 4") +
+              line(s.tp[2], "#0ecb81", "TP3", "6 4") +
+              line(s.entry, "#fcd535", "ENTRY", "none") +
+              `<text x="30" y="${Hh - 16}" font-size="14" fill="#474d57" font-family="DejaVu Sans, sans-serif">Educational only - not financial advice. Data: Binance Spot API.</text>` +
+              `</svg>`;
+          }
+
+          const pngs = [];
+          for (const s of setups) {
+            const png = await sharp(Buffer.from(chartSVG(s))).png().toBuffer();
+            pngs.push({ name: s.symbol + "-setup.png", buf: png });
+            if (DRY) fs.writeFileSync("/home/user/chart_" + s.symbol + ".png", png);
+          }
+          console.log("Charts rendered:", pngs.map((p) => p.name).join(", "));
+
+          // ---------- 4) UNIQUE POST TEXT ----------
+          const intros = [
+            "📊 Top 3 momentum plays right now - levels below 👇",
+            "🎯 3 trending coins, clean structures, real numbers 👇",
+            "🧭 Market scan done - today's 3 hot charts 👇",
+            "⚡ 3 movers worth your watchlist today 👇",
+            "🔥 Trend radar: 3 setups with entry, TP and SL 👇",
+          ];
+          const dirTag = (s) => (s.isLong ? "🟢 LONG" : "🔴 SHORT");
+          const block = (s) =>
+            `${dirTag(s)} $${s.symbol} - 24h ${s.pct >= 0 ? "+" : ""}${s.pct.toFixed(2)}%\n` +
+            `🎯 Entry: ${fmt(s.entry, s.dp)}\n` +
+            `✅ TP1: ${fmt(s.tp[0], s.dp)} | TP2: ${fmt(s.tp[1], s.dp)} | TP3: ${fmt(s.tp[2], s.dp)}\n` +
+            `🛑 Stop loss: ${fmt(s.sl, s.dp)}`;
+          const tagSets = [
+            ["#Crypto", "#Altcoins"], ["#Trading", "#CryptoNews"],
+            ["#BinanceSquare", "#Crypto"], ["#Altcoins", "#Trading"],
+          ];
+          const tags = tagSets[slot % tagSets.length].join(" ");
+
+          let intro = intros[slot % intros.length];
+          if (geminiKey) {
             try {
-              const cgRes = await fetch("https://api.coingecko.com/api/v3/search/trending");
-              if (cgRes.ok) {
-                const cg = await cgRes.json();
-                const trending = (cg.coins || [])
-                  .slice(0, 8)
-                  .map(c => c.item?.symbol || c.item?.name)
-                  .filter(Boolean);
-                if (trending.length) {
-                  marketBlock += "\nCOINGECKO TRENDING SEARCHES (live): " + trending.join(", ");
-                }
+              const url = "https://generativelanguage.googleapis.com/v1beta/models/" +
+                geminiModel + ":generateContent?key=" + encodeURIComponent(geminiKey);
+              const res = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  contents: [{ parts: [{ text:
+                    "Write ONE punchy opening line (max 70 chars) for a crypto market post " +
+                    "covering " + setups.map((s) => s.symbol).join(", ") +
+                    ". No numbers, no advice, add 1 emoji. Reply with the line only." }] }],
+                  generationConfig: { temperature: 1.0, maxOutputTokens: 60 },
+                }),
+              });
+              if (res.ok) {
+                const d = await res.json();
+                const line = d?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+                if (line && line.length <= 90) intro = line;
               }
             } catch (e) {
-              console.log("CoinGecko trending skipped: " + e.message);
+              console.log("Gemini intro skipped: " + e.message);
             }
-          } catch (e) {
-            marketBlock = "LIVE DATA UNAVAILABLE: " + e.message +
-              " - write a general, number-free observation instead. DO NOT invent any price or percentage.";
           }
 
-          // ---------- 2) UNIQUENESS ENGINE (time-seeded rotation) ----------
-          const seed = Math.floor(Date.now() / 1000);
-          const angles = [
-            "momentum and 24h price action check",
-            "volume and liquidity angle",
-            "overall market sentiment read (fear vs greed tone)",
-            "key psychological price levels to watch",
-            "short news-style market brief tone",
-            "retail trader positioning and risk-management angle",
-            "weekend vs weekday flow observation",
-          ];
-          const hooks = [
-            "Quick market scan:",
-            "Watching the tape:",
-            "Today's read:",
-            "Market radar:",
-            "Chart chatter:",
-            "On the feed:",
-            "Volume check:",
-          ];
-          const tagPool = ["#BTC", "#ETH", "#BNB", "#SOL", "#Crypto", "#Altcoins",
-            "#MarketUpdate", "#CryptoNews", "#Trading", "#BinanceSquare"];
-          const angle = angles[seed % angles.length];
-          const hook = hooks[(seed >> 2) % hooks.length];
-          const shuffledTags = [...tagPool].sort(() => 0.5 - (seed % 100) / 100);
-          const tags = shuffledTags.slice(0, 2 + (seed % 2)).join(" ");
-          const focusHint = (seed >> 3) % 3; // 0 majors, 1 gainers, 2 trending
+          const text =
+            intro + "\n\n" +
+            setups.map(block).join("\n\n") + "\n\n" +
+            tags + "\n" +
+            "⚠️ Educational only - not financial advice. DYOR.";
+          console.log("=== Post text (" + text.length + " chars) ===");
+          console.log(text);
 
-          const focusLine =
-            focusHint === 0 ? "Lead the post around one of the MAJOR COINS."
-            : focusHint === 1 ? "Lead the post around one of the TOP 24h GAINERS."
-            : "Lead the post around a COINGECKO TRENDING coin if listed, otherwise a MAJOR COIN.";
+          // ---------- 5) UPLOAD + PUBLISH ----------
+          function findUrl(obj) {
+            if (!obj || typeof obj !== "object") return null;
+            for (const [k, v] of Object.entries(obj)) {
+              if (typeof v === "string" && v.startsWith("http") && k !== "presignedUrl") return v;
+              if (typeof v === "object") { const f = findUrl(v); if (f) return f; }
+            }
+            return null;
+          }
 
-          // ---------- 3) GEMINI GENERATION ----------
-          const prompt =
-            `You are a Binance Square crypto market commentator.\n` +
-            `Write ONE short market insight post (max 260 characters) for retail crypto traders.\n` +
-            `Hook to start with: "${hook}"\n` +
-            `Angle: ${angle}.\n` +
-            `${focusLine}\n` +
-            `STRICT RULES:\n` +
-            `- Use ONLY the live numbers given below. NEVER invent or round a price or percentage. If no live number fits, write without numbers.\n` +
-            `- Factual, neutral tone. No financial advice, no buy/sell calls, no "get in" language.\n` +
-            `- Unique voice, varied sentence structure, ends with exactly these hashtags: ${tags}\n` +
-            `- Under 260 characters total.\n\n` +
-            `LIVE MARKET DATA:\n${marketBlock}`;
-
-          async function callGemini(p) {
-            const url =
-              "https://generativelanguage.googleapis.com/v1beta/models/" +
-              geminiModel + ":generateContent?key=" + encodeURIComponent(geminiKey);
-            const res = await fetch(url, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contents: [{ parts: [{ text: p }] }],
-                generationConfig: { temperature: 1.0, maxOutputTokens: 300 },
-              }),
+          async function uploadImage(png, name) {
+            const preRes = await fetch(SQUARE_BASE + "/v2/public/pgc/openApi/image/presignedUrl", {
+              method: "POST", headers: H(), body: JSON.stringify({ imageName: name }),
             });
-            if (!res.ok) {
-              throw new Error("Gemini API failed: " + res.status + " " + (await res.text()));
+            if (!preRes.ok) throw new Error("Presign failed: " + preRes.status + " " + (await preRes.text()));
+            const pre = (await preRes.json())?.data;
+            if (!pre?.presignedUrl || !pre?.fileTicket) throw new Error("Presign response missing fields: " + JSON.stringify(pre));
+
+            const upRes = await fetch(pre.presignedUrl, {
+              method: "PUT", headers: { "Content-Type": "image/png" }, body: png,
+            });
+            if (!upRes.ok) throw new Error("Image PUT failed: " + upRes.status + " " + (await upRes.text()));
+
+            for (let i = 0; i < 10; i++) {
+              await sleep(3000);
+              const stRes = await fetch(SQUARE_BASE + "/v2/public/pgc/openApi/image/imageStatus", {
+                method: "POST", headers: H(), body: JSON.stringify({ fileTicket: pre.fileTicket }),
+              });
+              const st = await stRes.json();
+              const url = findUrl(st?.data);
+              if (url) return url;
+              console.log("Image processing... poll " + (i + 1));
             }
-            const data = await res.json();
-            return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+            throw new Error("Image status never became ready for " + name);
           }
 
-          let content = await callGemini(prompt);
-          let attempt = 1;
-          while ((!content || content.length > 280) && attempt < 3) {
-            attempt += 1;
-            console.log("Retry #" + attempt + " (length=" + (content?.length ?? 0) + ")");
-            content = await callGemini(
-              prompt + `\n\nRETRY: previous output was ${content ? "too long" : "empty"}. ` +
-              `Output must be a single post under 260 characters.`
-            );
-          }
-          if (!content) throw new Error("Gemini returned empty content after retries");
-          if (content.length > 280) {
-            content = content.slice(0, 277).trimEnd() + "...";
+          if (DRY) {
+            console.log("=== DRY RUN: skipping upload & publish ===");
+            process.exit(0);
           }
 
-          console.log("=== Generated post (angle: " + angle + ") ===");
-          console.log(content);
+          const imageList = [];
+          for (const p of pngs) {
+            const url = await uploadImage(p.buf, p.name);
+            console.log("Uploaded " + p.name + " -> " + url);
+            imageList.push(url);
+          }
 
-          // ---------- 4) POST TO BINANCE SQUARE ----------
-          const squareUrl =
-            "https://www.binance.com/bapi/composite/v1/public/pgc/" +
-            "openApi/content/add";
-          const squareRes = await fetch(squareUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Square-OpenAPI-Key": squareKey,
-            },
-            body: JSON.stringify({ bodyTextOnly: content }),
+          const pubRes = await fetch(SQUARE_BASE + "/v1/public/pgc/openApi/content/add", {
+            method: "POST", headers: H(),
+            body: JSON.stringify({ contentType: 1, bodyTextOnly: text, imageList }),
           });
-
-          if (!squareRes.ok) {
-            throw new Error("Binance Square post failed: " +
-              squareRes.status + " " + (await squareRes.text()));
+          if (!pubRes.ok) {
+            throw new Error("Binance Square post failed: " + pubRes.status + " " + (await pubRes.text()));
           }
           console.log("=== Binance Square response ===");
-          console.log(await squareRes.text());
+          console.log(await pubRes.text());
           EOF
           node generate.mjs
