@@ -1,3 +1,4 @@
+---
 name: Binance Square Auto Post
 
 on:
@@ -41,11 +42,12 @@ jobs:
 
           const prompt = `You are a Binance Square crypto market commentator.
           Write ONE short market insight post (under 280 chars) for retail crypto traders.
-          Focus: factual, neutral, no financial advice, no emojis spam, no hashtags abuse.
-          Pick one of: BTC, ETH, BNB, SOL.`;
+          Focus: factual, neutral, no financial advice.
+          Pick one of: BTC, ETH, BNB, SOL. Use 1-3 hashtags only.`;
 
           const geminiUrl =
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=" +
+            "https://generativelanguage.googleapis.com/v1beta/" +
+            "models/gemini-3.8-flash:generateContent?key=" +
             encodeURIComponent(geminiKey);
 
           const geminiRes = await fetch(geminiUrl, {
@@ -58,29 +60,36 @@ jobs:
           });
 
           if (!geminiRes.ok) {
-            throw new Error("Gemini API failed: " + geminiRes.status + " " + (await geminiRes.text()));
+            throw new Error("Gemini API failed: " + geminiRes.status +
+              " " + (await geminiRes.text()));
           }
           const geminiData = await geminiRes.json();
           const content =
             geminiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
 
-          if (!content) throw new Error("Gemini returned empty content: " + JSON.stringify(geminiData));
+          if (!content) {
+            throw new Error("Gemini returned empty content: " +
+              JSON.stringify(geminiData));
+          }
 
           console.log("=== Generated post ===");
           console.log(content);
 
-          const squareUrl = "https://api.binance.com/square/api/v1/content/add";
+          const squareUrl =
+            "https://www.binance.com/bapi/composite/v1/public/pgc/" +
+            "openApi/content/add";
           const squareRes = await fetch(squareUrl, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "X-Api-Key": squareKey,
+              "X-Square-OpenAPI-Key": squareKey,
             },
-            body: JSON.stringify({ content }),
+            body: JSON.stringify({ bodyTextOnly: content }),
           });
 
           if (!squareRes.ok) {
-            throw new Error("Binance Square post failed: " + squareRes.status + " " + (await squareRes.text()));
+            throw new Error("Binance Square post failed: " +
+              squareRes.status + " " + (await squareRes.text()));
           }
           console.log("=== Binance Square response ===");
           console.log(await squareRes.text());
