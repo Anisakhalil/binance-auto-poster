@@ -2,19 +2,21 @@ name: Binance Square Auto Post
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "30 3 * * *"
-    - cron: "30 6 * * *"
-    - cron: "30 9 * * *"
-    - cron: "30 12 * * *"
-    - cron: "30 15 * * *"
-    - cron: "0 18 * * *"
+    - cron: "30 8 * * *"
+    - cron: "30 11 * * *"
+    - cron: "30 14 * * *"
+    - cron: "30 17 * * *"
+    - cron: "30 20 * * *"
+    - cron: "0 23 * * *"
+
+permissions:
+  contents: read
 
 jobs:
   post:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,76 +24,65 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: "20"
 
       - name: Generate Binance Square post with Gemini
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          cat > generate.mjs <<'EOF'
-          const key = process.env.GEMINI_API_KEY;
-
-          const prompt = `
-          Write ONE short, engaging Binance Square post about cryptocurrency.
-
-          Requirements:
-          - English language
-          - 500 characters maximum
-          - Educational and realistic
-          - No guaranteed profits
-          - No fake news or invented prices
-          - Do not give financial advice
-          - Use 2 or 3 relevant hashtags
-          - Make it natural and attractive for Binance Square
-          - Return ONLY the post text
-          `;
-
-          const response = await fetch(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-goog-api-key": key
-              },
-              body: JSON.stringify({
-                contents: [
-                  {
-                    parts: [{ text: prompt }]
-                  }
-                ]
-              })
-            }
-          );
-
-          if (!response.ok) {
-            throw new Error(await response.text());
-          }
-
-          const data = await response.json();
-          const text =
-            data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-
-          if (!text) {
-            throw new Error("Gemini returned no post text.");
-          }
-
-          console.log(text);
-          await import("node:fs/promises").then(fs =>
-            fs.writeFile(".square-post.txt", text)
-          );
-          EOF
-
-          node generate.mjs
-
-      - name: Download Binance Square posting skill
-        run: |
-          git clone --depth 1 https://github.com/binance/binance-skills-hub.git /tmp/binance-skills
-
-      - name: Publish to Binance Square
-        env:
           BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
         run: |
-          cd /tmp/binance-skills/skills/binance/square-post
-          node scripts/post-text.mjs \
-            --text "$(cat "$GITHUB_WORKSPACE/.square-post.txt")"
+          node --version
+          cat > generate.mjs <<'EOF'
+          const geminiKey = process.env.GEMINI_API_KEY;
+          const squareKey = process.env.BINANCE_SQUARE_OPENAPI_KEY;
+
+          if (!geminiKey) throw new Error("GEMINI_API_KEY secret missing");
+          if (!squareKey) throw new Error("BINANCE_SQUARE_OPENAPI_KEY secret missing");
+
+          const prompt = `You are a Binance Square crypto market commentator.
+          Write ONE short market insight post (under 280 chars) for retail crypto traders.
+          Focus: factual, neutral, no financial advice, no emojis spam, no hashtags abuse.
+          Pick one of: BTC, ETH, BNB, SOL.`;
+
+          const geminiUrl =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=" +
+            encodeURIComponent(geminiKey);
+
+          const geminiRes = await fetch(geminiUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ parts: [{ text: prompt }] }],
+              generationConfig: { temperature: 0.7, maxOutputTokens: 256 },
+            }),
+          });
+
+          if (!geminiRes.ok) {
+            throw new Error("Gemini API failed: " + geminiRes.status + " " + (await geminiRes.text()));
+          }
+          const geminiData = await geminiRes.json();
+          const content =
+            geminiData?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+          if (!content) throw new Error("Gemini returned empty content: " + JSON.stringify(geminiData));
+
+          console.log("=== Generated post ===");
+          console.log(content);
+
+          const squareUrl = "https://api.binance.com/square/api/v1/content/add";
+          const squareRes = await fetch(squareUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Api-Key": squareKey,
+            },
+            body: JSON.stringify({ content }),
+          });
+
+          if (!squareRes.ok) {
+            throw new Error("Binance Square post failed: " + squareRes.status + " " + (await squareRes.text()));
+          }
+          console.log("=== Binance Square response ===");
+          console.log(await squareRes.text());
+          EOF
+          node generate.mjs
