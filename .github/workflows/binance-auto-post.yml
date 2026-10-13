@@ -1,137 +1,140 @@
 
-name: Binance Square Quality Post Drafts
+name: Binance Square AI Auto Poster
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 8 * * *"
-    - cron: "30 14 * * *"
-    - cron: "30 20 * * *"
+    - cron: "0 3 * * *"
+    - cron: "0 9 * * *"
+    - cron: "0 15 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: binance-square-auto-poster
+  cancel-in-progress: false
+
 jobs:
-  draft:
+  post:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
-      - name: Generate researched post draft
+      - name: Generate AI crypto post
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          cat > generate.mjs <<'EOF'
-          const key = process.env.GEMINI_API_KEY;
-          if (!key) throw new Error("GEMINI_API_KEY is missing");
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
 
-          // Public 24-hour market statistics, not a trading signal.
-          const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "SUIUSDT"];
-          const url =
-            "https://api.binance.com/api/v3/ticker/24hr?symbols=" +
-            encodeURIComponent(JSON.stringify(symbols));
+          const apiKey = process.env.GEMINI_API_KEY;
+          if (!apiKey) throw new Error("GEMINI_API_KEY secret is missing.");
 
-          const marketRes = await fetch(url);
-          if (!marketRes.ok) {
-            throw new Error("Market data unavailable: " + marketRes.status);
+          const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"];
+          const market = [];
+
+          for (const symbol of symbols) {
+            const url = new URL(
+              "https://api.binance.com/api/v3/ticker/24hr"
+            );
+            url.searchParams.set("symbol", symbol);
+
+            const response = await fetch(url);
+            if (!response.ok) {
+              throw new Error(`Market data failed for ${symbol}: ${response.status}`);
+            }
+
+            const d = await response.json();
+            market.push({
+              symbol,
+              price: d.lastPrice,
+              change24h: d.priceChangePercent,
+              high24h: d.highPrice,
+              low24h: d.lowPrice
+            });
           }
 
-          const raw = await marketRes.json();
-          const market = raw.map(x => ({
-            symbol: x.symbol,
-            price: x.lastPrice,
-            change24hPercent: x.priceChangePercent,
-            high24h: x.highPrice,
-            low24h: x.lowPrice,
-            quoteVolume24h: x.quoteVolume
-          }));
-
-          const hour = new Date().getUTCHours();
-          const styles = [
-            {
-              title: "Market structure",
-              instruction:
-                "Explain the 24-hour market picture and important uncertainty."
-            },
-            {
-              title: "Coin comparison",
-              instruction:
-                "Compare two coins using the supplied data. Avoid unsupported claims."
-            },
-            {
-              title: "Trader education",
-              instruction:
-                "Teach one useful risk-management lesson using the supplied data."
-            }
-          ];
-
-          const slot = hour < 12 ? 0 : hour < 18 ? 1 : 2;
-          const style = styles[slot];
-
           const prompt = `
-          You are a careful crypto market research writer for Binance Square.
-
-          Create ONE original, useful post draft in English.
-          Topic: ${style.title}
-          Approach: ${style.instruction}
-
-          Verified market data (24-hour statistics):
-          ${JSON.stringify(market)}
+          Write ONE original, useful Binance Square crypto market post in English.
+          Use the following live 24-hour market data:
+          ${JSON.stringify(market, null, 2)}
 
           Requirements:
-          - 500 to 750 characters.
-          - Use at most 3 relevant coin cashtags.
-          - Include specific supplied figures where useful.
-          - Explain what the data does and does not show.
-          - Never invent news, support/resistance levels, indicators,
-            order-book information, chart patterns, or future prices.
-          - No guaranteed profits, "100% win rate", or pressure to trade.
-          - Do not tell readers to buy or sell.
-          - Include a concise risk disclaimer.
-          - Make this post distinct and useful, not generic hype.
-          - Output only the finished draft.
+          - 120 to 220 words maximum.
+          - Explain market context, not guaranteed future price movement.
+          - Use accurate numbers only from the supplied data.
+          - Include BTC, ETH and BNB where relevant.
+          - Add a short educational risk reminder.
+          - No fabricated news, unsupported claims, or guaranteed returns.
+          - No personalized financial advice.
+          - Use a few relevant hashtags.
+          - Output only the post text, with no title like "Here is your post".
           `;
 
-          const endpoint =
-            "https://generativelanguage.googleapis.com/v1beta/models/" +
-            "gemini-2.5-flash:generateContent?key=" +
-            encodeURIComponent(key);
-
-          const response = await fetch(endpoint, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: {
-                temperature: 0.65,
-                maxOutputTokens: 500
-              }
-            })
-          });
+          const response = await fetch(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-goog-api-key": apiKey
+              },
+              body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                  temperature: 0.7,
+                  maxOutputTokens: 500
+                }
+              })
+            }
+          );
 
           if (!response.ok) {
-            throw new Error(
-              "Gemini failed: " + response.status + " " +
-              (await response.text())
-            );
+            throw new Error(`Gemini API failed: ${response.status} ${await response.text()}`);
           }
 
           const data = await response.json();
-          const draft =
-            data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+          const post = data.candidates?.[0]?.content?.parts
+            ?.map(part => part.text || "")
+            .join("")
+            .trim();
 
-          if (!draft) throw new Error("No draft returned");
+          if (!post || post.length < 40) {
+            throw new Error("Gemini returned an empty or too-short post.");
+          }
 
-          console.log("=== REVIEW BEFORE MANUAL PUBLICATION ===");
-          console.log("Draft category:", style.title);
-          console.log("Market data timestamp (UTC):", new Date().toISOString());
-          console.log("=== POST DRAFT ===");
-          console.log(draft);
-          EOF
+          fs.writeFileSync("post.txt", post + "\n", "utf8");
+          console.log("AI post generated successfully.");
+          console.log(post);
+          NODE
 
-          node generate.mjs
+      - name: Get official Binance Square posting script
+        run: |
+          git clone --depth 1 \
+            https://github.com/binance/binance-skills-hub.git \
+            "$RUNNER_TEMP/binance-skills-hub"
+
+          test -f \
+            "$RUNNER_TEMP/binance-skills-hub/skills/binance/square-post/scripts/post-text.mjs"
+
+      - name: Publish text post to Binance Square
+        env:
+          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+        run: |
+          if [ -z "$BINANCE_SQUARE_OPENAPI_KEY" ]; then
+            echo "Missing BINANCE_SQUARE_OPENAPI_KEY secret."
+            exit 1
+          fi
+
+          node \
+            "$RUNNER_TEMP/binance-skills-hub/skills/binance/square-post/scripts/post-text.mjs" \
+            --text "$(cat post.txt)"
