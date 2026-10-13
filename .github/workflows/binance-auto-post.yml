@@ -1,140 +1,246 @@
-
-name: Binance Square AI Auto Poster
+---
+name: Binance Square Auto Post
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * *"
-    - cron: "0 9 * * *"
-    - cron: "0 15 * * *"
+    - cron: "30 6 * * *"
+    - cron: "30 11 * * *"
+    - cron: "30 16 * * *"
 
 permissions:
   contents: read
 
-concurrency:
-  group: binance-square-auto-poster
-  cancel-in-progress: false
-
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "22"
+          python-version: "3.11"
 
-      - name: Generate AI crypto post
+      - name: Install Python deps
+        run: pip install --quiet requests matplotlib mplfinance pandas numpy
+
+      - name: Generate and publish live post
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          node --input-type=module <<'NODE'
-          import fs from "node:fs";
-
-          const apiKey = process.env.GEMINI_API_KEY;
-          if (!apiKey) throw new Error("GEMINI_API_KEY secret is missing.");
-
-          const symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"];
-          const market = [];
-
-          for (const symbol of symbols) {
-            const url = new URL(
-              "https://api.binance.com/api/v3/ticker/24hr"
-            );
-            url.searchParams.set("symbol", symbol);
-
-            const response = await fetch(url);
-            if (!response.ok) {
-              throw new Error(`Market data failed for ${symbol}: ${response.status}`);
-            }
-
-            const d = await response.json();
-            market.push({
-              symbol,
-              price: d.lastPrice,
-              change24h: d.priceChangePercent,
-              high24h: d.highPrice,
-              low24h: d.lowPrice
-            });
-          }
-
-          const prompt = `
-          Write ONE original, useful Binance Square crypto market post in English.
-          Use the following live 24-hour market data:
-          ${JSON.stringify(market, null, 2)}
-
-          Requirements:
-          - 120 to 220 words maximum.
-          - Explain market context, not guaranteed future price movement.
-          - Use accurate numbers only from the supplied data.
-          - Include BTC, ETH and BNB where relevant.
-          - Add a short educational risk reminder.
-          - No fabricated news, unsupported claims, or guaranteed returns.
-          - No personalized financial advice.
-          - Use a few relevant hashtags.
-          - Output only the post text, with no title like "Here is your post".
-          `;
-
-          const response = await fetch(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-goog-api-key": apiKey
-              },
-              body: JSON.stringify({
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: {
-                  temperature: 0.7,
-                  maxOutputTokens: 500
-                }
-              })
-            }
-          );
-
-          if (!response.ok) {
-            throw new Error(`Gemini API failed: ${response.status} ${await response.text()}`);
-          }
-
-          const data = await response.json();
-          const post = data.candidates?.[0]?.content?.parts
-            ?.map(part => part.text || "")
-            .join("")
-            .trim();
-
-          if (!post || post.length < 40) {
-            throw new Error("Gemini returned an empty or too-short post.");
-          }
-
-          fs.writeFileSync("post.txt", post + "\n", "utf8");
-          console.log("AI post generated successfully.");
-          console.log(post);
-          NODE
-
-      - name: Get official Binance Square posting script
-        run: |
-          git clone --depth 1 \
-            https://github.com/binance/binance-skills-hub.git \
-            "$RUNNER_TEMP/binance-skills-hub"
-
-          test -f \
-            "$RUNNER_TEMP/binance-skills-hub/skills/binance/square-post/scripts/post-text.mjs"
-
-      - name: Publish text post to Binance Square
-        env:
           BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
         run: |
-          if [ -z "$BINANCE_SQUARE_OPENAPI_KEY" ]; then
-            echo "Missing BINANCE_SQUARE_OPENAPI_KEY secret."
-            exit 1
-          fi
+          mkdir -p out
+          cat > workflow.py <<'PYEOF'
+          import os, math, json, time, datetime, requests
+          import matplotlib
+          matplotlib.use('Agg')
+          matplotlib.rcParams['text.parse_math'] = False
+          import matplotlib.pyplot as plt
+          import mplfinance as mpf
+          import pandas as pd
 
-          node \
-            "$RUNNER_TEMP/binance-skills-hub/skills/binance/square-post/scripts/post-text.mjs" \
-            --text "$(cat post.txt)"
+          def fetch_json(url, timeout=15):
+              r = requests.get(url, timeout=timeout)
+              r.raise_for_status()
+              return r.json()
+
+          geminiKey = os.environ["GEMINI_API_KEY"]
+          squareKey = os.environ["BINANCE_SQUARE_OPENAPI_KEY"]
+
+          # 1. Live tickers from Binance official public mirror
+          tickers = fetch_json("https://data-api.binance.vision/api/v3/ticker/24hr")
+          print(f"[1] symbols: {len(tickers)}")
+
+          STABLES = {"USDC","FDUSD","TUSD","BUSD","DAI","EUR","USDP","PYUSD"}
+          LEVER = ("UP","DOWN","BULL","BEAR")
+
+          clean = []
+          for t in tickers:
+              sym = t['symbol']
+              if not sym.endswith("USDT"): continue
+              base = sym[:-4]
+              if base in STABLES: continue
+              if any(base.startswith(p) for p in LEVER): continue
+              try:
+                  price  = float(t['lastPrice']); change = float(t['priceChangePercent'])
+                  vol    = float(t['quoteVolume']); high = float(t['highPrice']); low = float(t['lowPrice'])
+              except (ValueError, KeyError): continue
+              if vol < 25_000_000: continue
+              if abs(change) < 1.5: continue
+              if change < -30 or change > 80: continue
+              clean.append({"sym":base,"price":price,"change":change,"vol":vol,"high":high,"low":low})
+
+          for c in clean:
+              c['score'] = abs(c['change']) * math.log10(c['vol']/1e6 + 1)
+          clean.sort(key=lambda x: x['score'], reverse=True)
+          top3 = clean[:3]
+          if len(top3) < 3:
+              print("[ERR] no liquid movers today"); raise SystemExit(0)
+          print(f"[2] top3: {[(c['sym'], round(c['change'],2)) for c in top3]}")
+
+          # 2. 1h candles (last 5 days)
+          def klines(sym):
+              return fetch_json(
+                  f"https://data-api.binance.vision/api/v3/klines?symbol={sym}USDT&interval=1h&limit=120")
+
+          print("[3] 1h klines...")
+          kdata = {c['sym']: klines(c['sym']) for c in top3}
+
+          # 3. Real candlestick charts per coin
+          BG, GRID = "#0f1320", "#223047"
+          UP, DN   = "#26d782", "#f6465d"
+          EMA_F, EMA_S = "#ffd166", "#5eb0ff"
+
+          chart_files = {}
+          for c in top3:
+              raw = kdata[c['sym']]
+              cols = ['time','open','high','low','close','volume',
+                      'close_time','quote_vol','trades','taker_buy_base',
+                      'taker_buy_quote','ignore']
+              df = pd.DataFrame(raw, columns=cols)
+              df['time'] = pd.to_datetime(df['time'], unit='ms')
+              df = df.set_index('time')[['open','high','low','close','volume']].astype(float)
+              df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+              df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+
+              mc = mpf.make_marketcolors(up=UP, down=DN, edge=UP, wick=UP,
+                                         volume={'up':UP,'down':DN})
+              s = mpf.make_mpf_style(marketcolors=mc, base_mpl_style='dark_background',
+                                     gridcolor=GRID, gridstyle=":", y_on_right=True,
+                                     rc={"axes.edgecolor":GRID,"xtick.color":"#cfd8dc",
+                                         "ytick.color":"#cfd8dc",
+                                         "axes.labelcolor":"#cfd8dc",
+                                         "text.color":"#eceff4"})
+              title = f"{c['sym']}USDT  spot={c['price']:.4g}  24h={c['change']:+.2f}%  vol={c['vol']/1e6:.0f}M"
+              fname = f'out/chart_{c["sym"]}.png'
+              mpf.plot(df[['open','high','low','close','volume']], type='candle',
+                       style=s,
+                       addplot=[mpf.make_addplot(df['ema20'], color=EMA_F, width=1.2),
+                                mpf.make_addplot(df['ema50'], color=EMA_S, width=1.2)],
+                       volume=True, title=title,
+                       savefig=dict(fname=fname, dpi=110, bbox_inches='tight',
+                                    facecolor=BG))
+              chart_files[c['sym']] = fname
+              print(f"[4] {fname} {os.path.getsize(fname)//1024}KB")
+
+          # 4. Upload chart anonymously so URL can be appended inline
+          def upload(path):
+              try:
+                  with open(path,'rb') as f:
+                      r = requests.post('https://0x0.st',
+                                        files={'file': f}, timeout=30)
+                  if r.ok and 'http' in r.text:
+                      return r.text.strip()
+              except Exception as e:
+                  print("0x0.st err:", e)
+              try:
+                  with open(path,'rb') as f:
+                      r = requests.post('https://catbox.moe/user/api.php',
+                                        data={'reqtype':'fileupload'},
+                                        files={'fileToUpload': f}, timeout=30)
+                  if r.ok and 'http' in r.text:
+                      return r.text.strip()
+              except Exception as e:
+                  print("catbox err:", e)
+              return None
+
+          chart_url = None
+          for sym, fname in chart_files.items():
+              chart_url = upload(fname)
+              if chart_url:
+                  print(f"[5] uploaded: {chart_url}")
+                  break
+
+          # 5. Compute entry/SL/TP1/TP2 from live spot price
+          def fmt(p): return f"{p:.2f}" if p>=1 else f"{p:.6g}"
+          def zone(p, ch):
+              if ch >= 0:
+                  return ("LONG", round(p*0.998, 6 if p<1 else 2),
+                          round(p*0.985, 6 if p<1 else 2),
+                          round(p*1.025, 6 if p<1 else 2),
+                          round(p*1.050, 6 if p<1 else 2))
+              return ("SHORT", round(p*1.002, 6 if p<1 else 2),
+                      round(p*1.015, 6 if p<1 else 2),
+                      round(p*0.975, 6 if p<1 else 2),
+                      round(p*0.950, 6 if p<1 else 2))
+
+          zones = []
+          for c in top3:
+              bias, e, sl, tp1, tp2 = zone(c['price'], c['change'])
+              zones.append({"sym":c['sym'], "price":c['price'], "change":c['change'],
+                            "bias":bias, "entry":e, "sl":sl, "tp1":tp1, "tp2":tp2})
+
+          # 6. Compose through Gemini with EXACT numbers (no hallucination)
+          coins_block = "\n".join(
+              f"${z['sym']}: spot={fmt(z['price'])}, 24h={z['change']:+.2f}%, "
+              f"entry={fmt(z['entry'])}, SL={fmt(z['sl'])}, "
+              f"TP1={fmt(z['tp1'])}, TP2={fmt(z['tp2'])}"
+              for z in zones)
+
+          prompt = (
+            "You write short Binance Square trading alerts. "
+            "Use these EXACT live numbers (no rounding):\n"
+            f"{coins_block}\n\n"
+            "Compose ONE post under 600 chars:\n"
+            "- HOOK line (<80 chars, attention, no profit promise).\n"
+            "- 3 bullets, one per coin, each contains $CASHTAG, spot, "
+            "24h %, entry, SL, TP1, TP2.\n"
+            "- 1 verdict line.\n"
+            "- 'DYOR - not financial advice.'\n"
+            "- 2-4 hashtags (#Crypto #BinanceSquare + coin tags).\n"
+            "No 'guaranteed', no 'risk free', no 'sure profit'. "
+            "Educational only. No markdown, plain newlines.")
+
+          post_text = None
+          try:
+              gurl = ("https://generativelanguage.googleapis.com/v1beta/"
+                      "models/gemini-3.8-flash:generateContent?key=" + geminiKey)
+              gr = requests.post(gurl, json={
+                  "contents":[{"parts":[{"text": prompt}]}],
+                  "generationConfig":{"temperature":0.8,"maxOutputTokens":900}
+              }, timeout=30)
+              if gr.ok:
+                  post_text = gr.json()['candidates'][0]['content'][
+                      'parts'][0]['text'].strip()
+              else:
+                  print("[gemini]", gr.status, gr.text[:200])
+          except Exception as e:
+              print("[gemini] err:", e)
+
+          if not post_text:
+              HOOK = "🔥 24h watchlist — biggest liquid movers on Binance:"
+              post_text = HOOK + "\n\n" + "\n".join(
+                  f"💎 ${z['sym']} ({z['bias']})\n"
+                  f"   spot {fmt(z['price'])} ▸ 24h {z['change']:+.2f}%\n"
+                  f"   entry {fmt(z['entry'])} • SL {fmt(z['sl'])} • "
+                  f"TP1 {fmt(z['tp1'])} • TP2 {fmt(z['tp2'])}"
+                  for z in zones
+              ) + ("\n\n📈 Chart: " + chart_url if chart_url else
+                   "\n\n📈 Levels marked on chart.\n\n") + \
+                  "DYOR - not financial advice. #Crypto #BinanceSquare"
+
+          if chart_url and ("chart_url" not in post_text.lower()):
+              post_text += "\n\n🖼 " + chart_url
+
+          print("\n=== POST ===\n" + post_text)
+          print(f"\nlen={len(post_text)}")
+
+          # 7. Push to Binance Square via OpenAPI text endpoint
+          r = requests.post(
+              "https://www.binance.com/bapi/composite/v1/public/pgc/"
+              "openApi/content/add",
+              headers={
+                  "Content-Type": "application/json",
+                  "X-Square-OpenAPI-Key": squareKey,
+              },
+              json={"bodyTextOnly": post_text},
+              timeout=30)
+          print(f"\n[square] {r.status_code}")
+          print(r.text[:600])
+          if not r.ok:
+              raise SystemExit(f"Square failed: HTTP {r.status_code}")
+          PYEOF
+          python3 workflow.py
