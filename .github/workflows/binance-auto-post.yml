@@ -1,20 +1,21 @@
----
-name: Binance Square Auto Post
+name: Binance Square Analyst Drafts
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 6 * * *"
-    - cron: "30 11 * * *"
-    - cron: "30 16 * * *"
+    # 4 runs/day. Each run adds a random 0-45 min delay so timings never look mechanical.
+    - cron: "0 6 * * *"
+    - cron: "0 10 * * *"
+    - cron: "0 14 * * *"
+    - cron: "0 18 * * *"
 
 permissions:
   contents: read
 
 jobs:
-  post:
+  draft:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,220 +28,321 @@ jobs:
       - name: Install Python deps
         run: pip install --quiet requests matplotlib mplfinance pandas numpy
 
-      - name: Generate and publish live post
+      - name: Build one analyst draft
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+          GEMINI_MODEL: "gemini-2.5-flash"
+          # POST_MODE=draft  -> saves draft.md + chart.png as an artifact (recommended)
+          # POST_MODE=live   -> also pushes the TEXT to Binance Square via OpenAPI
+          POST_MODE: "draft"
         run: |
           mkdir -p out
-          cat > workflow.py <<'PYEOF'
-          import os, math, json, time, datetime, requests
+          python3 - <<'PYEOF'
+          import os, json, math, random, time, datetime
+          import requests
+          import numpy as np
+          import pandas as pd
           import matplotlib
           matplotlib.use('Agg')
           matplotlib.rcParams['text.parse_math'] = False
           import matplotlib.pyplot as plt
           import mplfinance as mpf
-          import pandas as pd
 
-          def fetch_json(url, timeout=15):
-              r = requests.get(url, timeout=timeout)
+          API = 'https://data-api.binance.vision/api/v3'
+          OUT = 'out'
+          os.makedirs(OUT, exist_ok=True)
+
+          RUN = int(os.environ.get('GITHUB_RUN_NUMBER', '1'))
+          MODE = os.environ.get('POST_MODE', 'draft').lower()
+          MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
+          random.seed(RUN * 7919 + int(time.time() // 3600))
+
+          # spread the run so posting times are never identical
+          time.sleep(random.randint(0, 45 * 60))
+
+          def fetch(path, **p):
+              r = requests.get(API + path, params=p, timeout=25)
               r.raise_for_status()
               return r.json()
 
-          geminiKey = os.environ["GEMINI_API_KEY"]
-          squareKey = os.environ["BINANCE_SQUARE_OPENAPI_KEY"]
-
-          # 1. Live tickers from Binance official public mirror
-          tickers = fetch_json("https://data-api.binance.vision/api/v3/ticker/24hr")
-          print(f"[1] symbols: {len(tickers)}")
-
-          STABLES = {"USDC","FDUSD","TUSD","BUSD","DAI","EUR","USDP","PYUSD"}
+          # ---------- 1. LIVE candidate scan (never a hardcoded coin list) ----------
+          tickers = fetch('/ticker/24hr')
+          STABLES = {"USDC","FDUSD","TUSD","BUSD","DAI","EUR","USDP","PYUSD","AEUR","EURI","XUSD"}
           LEVER = ("UP","DOWN","BULL","BEAR")
-
-          clean = []
+          # tokenised gold / stocks / other non-crypto wrappers - keep the feed to real crypto
+          EXCLUDE = {"XAUT","PAXG","XAUM","SPCXB","SPYB","QQQB","TSLAB","NVDB","METAB",
+                     "GOOGLB","AMZNB","AAPLB","MSFTB","COINB","HOODB","CRCLB"}
+          cands, bup, bdn = [], 0, 0
           for t in tickers:
-              sym = t['symbol']
-              if not sym.endswith("USDT"): continue
+              sym = t.get('symbol','')
+              if not sym.endswith('USDT'):
+                  continue
               base = sym[:-4]
-              if base in STABLES: continue
-              if any(base.startswith(p) for p in LEVER): continue
+              if base in STABLES or base in EXCLUDE or any(base.startswith(x) for x in LEVER):
+                  continue
               try:
-                  price  = float(t['lastPrice']); change = float(t['priceChangePercent'])
-                  vol    = float(t['quoteVolume']); high = float(t['highPrice']); low = float(t['lowPrice'])
-              except (ValueError, KeyError): continue
-              if vol < 25_000_000: continue
-              if abs(change) < 1.5: continue
-              if change < -30 or change > 80: continue
-              clean.append({"sym":base,"price":price,"change":change,"vol":vol,"high":high,"low":low})
+                  price = float(t['lastPrice']); ch = float(t['priceChangePercent'])
+                  vol = float(t['quoteVolume']); hi = float(t['highPrice']); lo = float(t['lowPrice'])
+              except Exception:
+                  continue
+              if vol < 5_000_000:
+                  continue
+              if ch > 0: bup += 1
+              else: bdn += 1
+              if vol < 25_000_000 or abs(ch) < 1.5:
+                  continue
+              if ch < -35 or ch > 90:
+                  continue
+              cands.append(dict(sym=base, price=price, ch=ch, vol=vol, hi=hi, lo=lo))
 
-          for c in clean:
-              c['score'] = abs(c['change']) * math.log10(c['vol']/1e6 + 1)
-          clean.sort(key=lambda x: x['score'], reverse=True)
-          top3 = clean[:3]
-          if len(top3) < 3:
-              print("[ERR] no liquid movers today"); raise SystemExit(0)
-          print(f"[2] top3: {[(c['sym'], round(c['change'],2)) for c in top3]}")
+          cands.sort(key=lambda c: abs(c['ch']) * math.log10(c['vol']/1e6 + 1), reverse=True)
+          pool = cands[:24]
+          print(f"[1] candidates={len(pool)} breadth up={bup} down={bdn}")
 
-          # 2. 1h candles (last 5 days)
-          def klines(sym):
-              return fetch_json(
-                  f"https://data-api.binance.vision/api/v3/klines?symbol={sym}USDT&interval=1h&limit=120")
+          def rsi(s, n=14):
+              d = s.diff()
+              up = d.clip(lower=0).rolling(n).mean()
+              dn = (-d.clip(upper=0)).rolling(n).mean()
+              return 100 - 100/(1 + up/dn.replace(0, np.nan))
 
-          print("[3] 1h klines...")
-          kdata = {c['sym']: klines(c['sym']) for c in top3}
-
-          # 3. Real candlestick charts per coin
-          BG, GRID = "#0f1320", "#223047"
-          UP, DN   = "#26d782", "#f6465d"
-          EMA_F, EMA_S = "#ffd166", "#5eb0ff"
-
-          chart_files = {}
-          for c in top3:
-              raw = kdata[c['sym']]
-              cols = ['time','open','high','low','close','volume',
-                      'close_time','quote_vol','trades','taker_buy_base',
-                      'taker_buy_quote','ignore']
+          DATA, rows = {}, []
+          for c in pool:
+              try:
+                  raw = fetch('/klines', symbol=c['sym']+'USDT', interval='1h', limit=168)
+              except Exception as e:
+                  print('  klines fail', c['sym'], e); continue
+              if not raw:
+                  continue
+              cols = ['time','open','high','low','close','volume','ct','qv','tr','tbb','tbq','ig']
               df = pd.DataFrame(raw, columns=cols)
               df['time'] = pd.to_datetime(df['time'], unit='ms')
               df = df.set_index('time')[['open','high','low','close','volume']].astype(float)
               df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
               df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+              df['rsi'] = rsi(df['close'])
+              qv = df['close'] * df['volume']
+              last24 = float(qv.iloc[-24:].sum())
+              prev = qv.iloc[-120:-24]
+              avg24 = float(prev.mean()*24) if len(prev) else float('nan')
+              surge = last24/avg24 if avg24 == avg24 and avg24 > 0 else 1.0
+              px = float(df['close'].iloc[-1])
+              e20 = float(df['ema20'].iloc[-1]); e50 = float(df['ema50'].iloc[-1])
+              r = float(df['rsi'].iloc[-1])
+              trend = 'up' if px > e20 > e50 else ('down' if px < e20 < e50 else 'mixed')
+              score = (abs(c['ch']) * math.log10(c['vol']/1e6 + 1)
+                       * min(max(surge, 1.0), 4.0)
+                       * (1.4 if trend != 'mixed' else 1.0)
+                       * (1.15 if 35 <= r <= 72 else 0.85))
+              rows.append(dict(sym=c['sym'], price=px, ch=c['ch'], vol=c['vol'], surge=surge,
+                               rsi=r, ema20=e20, ema50=e50, trend=trend,
+                               hi7=float(df['high'].max()), lo7=float(df['low'].min()), score=score))
+              DATA[c['sym']] = df
 
-              mc = mpf.make_marketcolors(up=UP, down=DN, edge=UP, wick=UP,
-                                         volume={'up':UP,'down':DN})
-              s = mpf.make_mpf_style(marketcolors=mc, base_mpl_style='dark_background',
-                                     gridcolor=GRID, gridstyle=":", y_on_right=True,
-                                     rc={"axes.edgecolor":GRID,"xtick.color":"#cfd8dc",
-                                         "ytick.color":"#cfd8dc",
-                                         "axes.labelcolor":"#cfd8dc",
-                                         "text.color":"#eceff4"})
-              title = f"{c['sym']}USDT  spot={c['price']:.4g}  24h={c['change']:+.2f}%  vol={c['vol']/1e6:.0f}M"
-              fname = f'out/chart_{c["sym"]}.png'
-              mpf.plot(df[['open','high','low','close','volume']], type='candle',
-                       style=s,
-                       addplot=[mpf.make_addplot(df['ema20'], color=EMA_F, width=1.2),
-                                mpf.make_addplot(df['ema50'], color=EMA_S, width=1.2)],
-                       volume=True, title=title,
-                       savefig=dict(fname=fname, dpi=110, bbox_inches='tight',
-                                    facecolor=BG))
-              chart_files[c['sym']] = fname
-              print(f"[4] {fname} {os.path.getsize(fname)//1024}KB")
+          rows.sort(key=lambda x: x['score'], reverse=True)
+          picks = rows[:3]
+          if len(picks) < 3:
+              print('[ERR] not enough trendable coins today'); raise SystemExit(0)
+          print('[2] picks:', [(p['sym'], round(p['ch'], 2), round(p['surge'], 2)) for p in picks])
 
-          # 4. Upload chart anonymously so URL can be appended inline
-          def upload(path):
-              try:
-                  with open(path,'rb') as f:
-                      r = requests.post('https://0x0.st',
-                                        files={'file': f}, timeout=30)
-                  if r.ok and 'http' in r.text:
-                      return r.text.strip()
-              except Exception as e:
-                  print("0x0.st err:", e)
-              try:
-                  with open(path,'rb') as f:
-                      r = requests.post('https://catbox.moe/user/api.php',
-                                        data={'reqtype':'fileupload'},
-                                        files={'fileToUpload': f}, timeout=30)
-                  if r.ok and 'http' in r.text:
-                      return r.text.strip()
-              except Exception as e:
-                  print("catbox err:", e)
-              return None
+          # ---------- 2. educational level scenarios (real levels, no invented numbers) ----------
+          def fmt(v):
+              return f"{v:.2f}" if v >= 1 else f"{v:.6g}"
 
-          chart_url = None
-          for sym, fname in chart_files.items():
-              chart_url = upload(fname)
-              if chart_url:
-                  print(f"[5] uploaded: {chart_url}")
-                  break
+          for p in picks:
+              if p['trend'] == 'up':
+                  p['bias'] = 'LONG'
+                  p['entry'] = p['price']
+                  p['sl'] = min(p['ema50'], p['price'] * 0.982)
+                  p['tp1'] = p['hi7']
+                  p['tp2'] = p['hi7'] * 1.05
+              elif p['trend'] == 'down':
+                  p['bias'] = 'SHORT'
+                  p['entry'] = p['price']
+                  p['sl'] = max(p['ema50'], p['price'] * 1.018)
+                  p['tp1'] = p['lo7']
+                  p['tp2'] = p['lo7'] * 0.95
+              else:
+                  p['bias'] = 'RANGE'
+                  p['entry'] = p['price']
+                  p['sl'] = p['lo7']
+                  p['tp1'] = p['ema20']
+                  p['tp2'] = p['hi7']
 
-          # 5. Compute entry/SL/TP1/TP2 from live spot price
-          def fmt(p): return f"{p:.2f}" if p>=1 else f"{p:.6g}"
-          def zone(p, ch):
-              if ch >= 0:
-                  return ("LONG", round(p*0.998, 6 if p<1 else 2),
-                          round(p*0.985, 6 if p<1 else 2),
-                          round(p*1.025, 6 if p<1 else 2),
-                          round(p*1.050, 6 if p<1 else 2))
-              return ("SHORT", round(p*1.002, 6 if p<1 else 2),
-                      round(p*1.015, 6 if p<1 else 2),
-                      round(p*0.975, 6 if p<1 else 2),
-                      round(p*0.950, 6 if p<1 else 2))
+          # ---------- 3. rotate the CHART TYPE every run ----------
+          BG, GRID = '#0b0e14', '#1e2733'
+          UP, DN = '#26d782', '#f6465d'
+          EMA_F, EMA_S = '#ffd166', '#5eb0ff'
 
-          zones = []
-          for c in top3:
-              bias, e, sl, tp1, tp2 = zone(c['price'], c['change'])
-              zones.append({"sym":c['sym'], "price":c['price'], "change":c['change'],
-                            "bias":bias, "entry":e, "sl":sl, "tp1":tp1, "tp2":tp2})
+          def mstyle():
+              mc = mpf.make_marketcolors(up=UP, down=DN, edge={'up': UP, 'down': DN},
+                                         wick={'up': UP, 'down': DN}, volume={'up': UP, 'down': DN})
+              return mpf.make_mpf_style(marketcolors=mc, base_mpl_style='dark_background',
+                                        gridcolor=GRID, gridstyle=':', y_on_right=True,
+                                        facecolor=BG, figcolor=BG,
+                                        rc={'axes.edgecolor': GRID, 'xtick.color': '#9fb0c0',
+                                            'ytick.color': '#9fb0c0', 'axes.labelcolor': '#c6d2de',
+                                            'text.color': '#e6edf3', 'axes.titlecolor': '#e6edf3'})
 
-          # 6. Compose through Gemini with EXACT numbers (no hallucination)
+          CTYPES = ['candles_ema_volume', 'candles_rsi', 'levels_map', 'perf_compare']
+          ctype = CTYPES[RUN % len(CTYPES)]
+          chart = None
+
+          if ctype == 'candles_ema_volume':
+              p = picks[0]; d = DATA[p['sym']].iloc[-96:]
+              chart = f"{OUT}/chart_{p['sym']}_ema.png"
+              mpf.plot(d, type='candle', style=mstyle(), volume=True,
+                       addplot=[mpf.make_addplot(d['ema20'], color=EMA_F, width=1.1),
+                                mpf.make_addplot(d['ema50'], color=EMA_S, width=1.1)],
+                       title=f"{p['sym']}/USDT 1H | {fmt(p['price'])} | 24h {p['ch']:+.2f}% | vol {p['surge']:.1f}x avg",
+                       savefig=dict(fname=chart, dpi=115, bbox_inches='tight', facecolor=BG))
+          elif ctype == 'candles_rsi':
+              p = picks[1]; d = DATA[p['sym']].iloc[-96:]
+              chart = f"{OUT}/chart_{p['sym']}_rsi.png"
+              ap = [mpf.make_addplot(d['ema20'], color=EMA_F, width=1.1),
+                    mpf.make_addplot(d['ema50'], color=EMA_S, width=1.1),
+                    mpf.make_addplot(d['rsi'], panel=2, color='#c792ea', width=1.2),
+                    mpf.make_addplot(pd.Series(70, index=d.index), panel=2, color=DN, width=0.8, linestyle='--'),
+                    mpf.make_addplot(pd.Series(30, index=d.index), panel=2, color=UP, width=0.8, linestyle='--')]
+              mpf.plot(d, type='candle', style=mstyle(), volume=True, panel_ratios=(6, 2, 2),
+                       addplot=ap, ylabel='price', ylabel_lower='volume',
+                       title=f"{p['sym']}/USDT 1H + RSI(14)={p['rsi']:.1f} | 24h {p['ch']:+.2f}%",
+                       savefig=dict(fname=chart, dpi=115, bbox_inches='tight', facecolor=BG))
+          elif ctype == 'levels_map':
+              p = picks[0]; d = DATA[p['sym']].iloc[-120:]
+              chart = f"{OUT}/chart_{p['sym']}_levels.png"
+              fig, ax = plt.subplots(figsize=(11, 5.6), facecolor=BG); ax.set_facecolor(BG)
+              ax.plot(d.index, d['close'], color='#e6edf3', lw=1.6)
+              for lvl, col, lbl in [(p['hi7'], DN, '7d high'), (p['lo7'], UP, '7d low'),
+                                    (p['ema20'], EMA_F, 'EMA20'), (p['ema50'], EMA_S, 'EMA50')]:
+                  ax.axhline(lvl, color=col, ls='--', lw=1.1)
+                  ax.text(d.index[2], lvl, f" {lbl} {fmt(lvl)}", color=col, fontsize=9, va='bottom')
+              ax.set_title(f"{p['sym']}/USDT 1H level map | last {fmt(p['price'])} | 24h {p['ch']:+.2f}%",
+                           color='#e6edf3', fontsize=12)
+              ax.grid(color=GRID, ls=':', lw=0.7)
+              for s in ax.spines.values(): s.set_color(GRID)
+              ax.tick_params(colors='#9fb0c0')
+              fig.tight_layout(); fig.savefig(chart, dpi=115, facecolor=BG); plt.close(fig)
+          else:
+              chart = f"{OUT}/chart_perf_compare.png"
+              fig, ax = plt.subplots(figsize=(11, 5.6), facecolor=BG); ax.set_facecolor(BG)
+              for pp, col in zip(picks, ['#ffd166', '#5eb0ff', '#c792ea']):
+                  d = DATA[pp['sym']].iloc[-120:]
+                  norm = d['close']/d['close'].iloc[0]*100 - 100
+                  ax.plot(norm.index, norm.values, color=col, lw=1.9,
+                          label=f"{pp['sym']} ({pp['ch']:+.2f}% 24h)")
+              ax.axhline(0, color=GRID, lw=1)
+              ax.set_title('Last 5 days - % move comparison', color='#e6edf3', fontsize=12)
+              ax.grid(color=GRID, ls=':', lw=0.7)
+              ax.legend(facecolor=BG, edgecolor=GRID, labelcolor='#e6edf3')
+              for s in ax.spines.values(): s.set_color(GRID)
+              ax.tick_params(colors='#9fb0c0')
+              fig.tight_layout(); fig.savefig(chart, dpi=115, facecolor=BG); plt.close(fig)
+
+          print(f"[3] chart={ctype} {chart} {os.path.getsize(chart)//1024}KB")
+
+          # ---------- 4. rotate the POST STYLE every run ----------
+          STYLES = ['single_coin_ta', 'two_coin_compare', 'market_breadth',
+                    'level_map_post', 'narrative_angle', 'question_hook']
+          style = STYLES[(RUN * 3) % len(STYLES)]
+          HEAD = {
+            'single_coin_ta': 'one coin, deep dive. pick ONE from the list below',
+            'two_coin_compare': 'compare TWO of the coins below - which is stronger and why',
+            'market_breadth': f"market-wide read using this breadth data: {bup} up / {bdn} down",
+            'level_map_post': 'explain the level map on the chart - where price is sitting and why',
+            'narrative_angle': 'lead with the sector/narrative story, then the numbers',
+            'question_hook': 'end with a genuine question that invites replies',
+          }
+
           coins_block = "\n".join(
-              f"${z['sym']}: spot={fmt(z['price'])}, 24h={z['change']:+.2f}%, "
-              f"entry={fmt(z['entry'])}, SL={fmt(z['sl'])}, "
-              f"TP1={fmt(z['tp1'])}, TP2={fmt(z['tp2'])}"
-              for z in zones)
+              f"${p['sym']}: spot={fmt(p['price'])}, 24h={p['ch']:+.2f}%, volume=${p['vol']/1e6:.0f}M, "
+              f"volume_vs_own_average={p['surge']:.1f}x, RSI14={p['rsi']:.1f}, "
+              f"EMA20={fmt(p['ema20'])}, EMA50={fmt(p['ema50'])}, trend={p['trend']}, "
+              f"7d_high={fmt(p['hi7'])}, 7d_low={fmt(p['lo7'])}, "
+              f"scenario={p['bias']}, entry={fmt(p['entry'])}, SL={fmt(p['sl'])}, "
+              f"TP1={fmt(p['tp1'])}, TP2={fmt(p['tp2'])}"
+              for p in picks)
 
           prompt = (
-            "You write short Binance Square trading alerts. "
-            "Use these EXACT live numbers (no rounding):\n"
-            f"{coins_block}\n\n"
-            "Compose ONE post under 600 chars:\n"
-            "- HOOK line (<80 chars, attention, no profit promise).\n"
-            "- 3 bullets, one per coin, each contains $CASHTAG, spot, "
-            "24h %, entry, SL, TP1, TP2.\n"
-            "- 1 verdict line.\n"
-            "- 'DYOR - not financial advice.'\n"
-            "- 2-4 hashtags (#Crypto #BinanceSquare + coin tags).\n"
-            "No 'guaranteed', no 'risk free', no 'sure profit'. "
-            "Educational only. No markdown, plain newlines.")
+            "You are a professional crypto market analyst writing a Binance Square post. "
+            "Write like a real human trader, NOT like a bot. Mixed Roman Urdu + English is fine.\n"
+            f"TODAY'S POST STYLE: {style} - {HEAD[style]}\n"
+            "RULES:\n"
+            "- Use ONLY these live numbers, never invent or round a price:\n"
+            f"{coins_block}\n"
+            "- Give it a FRESH headline. Do NOT use the phrase '24h watchlist' or "
+            "'biggest liquid movers'. Never reuse the same opening line twice.\n"
+            "- Always write cashtags with a dollar sign, e.g. $BTC.\n"
+            "- Under 600 characters. Plain text, no markdown, no bullet symbols other than '- '.\n"
+            "- Say clearly that the levels are educational scenarios, not signals.\n"
+            "- End with exactly: 'DYOR - not financial advice.' then 2-4 hashtags.\n"
+            "- Disclose that AI tools assisted the draft.\n"
+            "- NEVER use: guaranteed, risk free, sure profit, pakka, no loss.\n"
+            "- Never promise or imply any profit.")
 
           post_text = None
           try:
-              gurl = ("https://generativelanguage.googleapis.com/v1beta/"
-                      "models/gemini-3.8-flash:generateContent?key=" + geminiKey)
+              gurl = ("https://generativelanguage.googleapis.com/v1beta/models/"
+                      f"{MODEL}:generateContent?key=" + os.environ["GEMINI_API_KEY"])
               gr = requests.post(gurl, json={
-                  "contents":[{"parts":[{"text": prompt}]}],
-                  "generationConfig":{"temperature":0.8,"maxOutputTokens":900}
-              }, timeout=30)
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 1.0, "maxOutputTokens": 900}
+              }, timeout=45)
               if gr.ok:
-                  post_text = gr.json()['candidates'][0]['content'][
-                      'parts'][0]['text'].strip()
+                  post_text = gr.json()['candidates'][0]['content']['parts'][0]['text'].strip()
               else:
-                  print("[gemini]", gr.status, gr.text[:200])
+                  print('[gemini]', gr.status_code, gr.text[:300])
           except Exception as e:
-              print("[gemini] err:", e)
+              print('[gemini] err:', e)
+
+          # ---------- 5. compliance guard ----------
+          BANNED = ['guaranteed', 'guarantee', 'risk free', 'risk-free', 'sure profit',
+                    'assured profit', 'no loss', 'pakka', '100% profit', '24h watchlist']
+          if post_text:
+              low = post_text.lower()
+              if any(b in low for b in BANNED):
+                  print('[guard] banned phrase found -> falling back to template')
+                  post_text = None
 
           if not post_text:
-              HOOK = "🔥 24h watchlist — biggest liquid movers on Binance:"
-              post_text = HOOK + "\n\n" + "\n".join(
-                  f"💎 ${z['sym']} ({z['bias']})\n"
-                  f"   spot {fmt(z['price'])} ▸ 24h {z['change']:+.2f}%\n"
-                  f"   entry {fmt(z['entry'])} • SL {fmt(z['sl'])} • "
-                  f"TP1 {fmt(z['tp1'])} • TP2 {fmt(z['tp2'])}"
-                  for z in zones
-              ) + ("\n\n📈 Chart: " + chart_url if chart_url else
-                   "\n\n📈 Levels marked on chart.\n\n") + \
-                  "DYOR - not financial advice. #Crypto #BinanceSquare"
+              lines = [f"Market read - {datetime.datetime.utcnow():%d %b %Y} (UTC)"]
+              lines.append(f"Breadth: {bup} coins up / {bdn} down on Binance USDT pairs.")
+              lines.append("")
+              for p in picks:
+                  lines.append(f"${p['sym']} ({p['bias']})")
+                  lines.append(f"- spot {fmt(p['price'])} | 24h {p['ch']:+.2f}% | volume {p['surge']:.1f}x its own average")
+                  lines.append(f"- EMA20 {fmt(p['ema20'])} | EMA50 {fmt(p['ema50'])} | RSI14 {p['rsi']:.1f}")
+                  lines.append(f"- educational scenario: entry {fmt(p['entry'])} | SL {fmt(p['sl'])} | TP1 {fmt(p['tp1'])} | TP2 {fmt(p['tp2'])}")
+                  lines.append("")
+              lines.append("Levels above are educational scenarios, not trade signals.")
+              lines.append("DYOR - not financial advice.")
+              lines.append("#Crypto #BinanceSquare #Altcoins")
+              lines.append("(Draft prepared with AI assistance, reviewed by me.)")
+              post_text = "\n".join(lines)
 
-          if chart_url and ("chart_url" not in post_text.lower()):
-              post_text += "\n\n🖼 " + chart_url
+          with open(f'{OUT}/draft.md', 'w') as f:
+              f.write(post_text)
+          with open(f'{OUT}/picks.json', 'w') as f:
+              json.dump(picks, f, indent=1, default=str)
 
-          print("\n=== POST ===\n" + post_text)
-          print(f"\nlen={len(post_text)}")
+          print('\n=== DRAFT ===\n' + post_text)
+          print(f"\nchars={len(post_text)}  style={style}  chart={ctype}")
 
-          # 7. Push to Binance Square via OpenAPI text endpoint
-          r = requests.post(
-              "https://www.binance.com/bapi/composite/v1/public/pgc/"
-              "openApi/content/add",
-              headers={
-                  "Content-Type": "application/json",
-                  "X-Square-OpenAPI-Key": squareKey,
-              },
-              json={"bodyTextOnly": post_text},
-              timeout=30)
-          print(f"\n[square] {r.status_code}")
-          print(r.text[:600])
-          if not r.ok:
-              raise SystemExit(f"Square failed: HTTP {r.status_code}")
+          # ---------- 6. optional push (text only) ----------
+          if MODE == 'live':
+              r = requests.post(
+                  "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add",
+                  headers={"Content-Type": "application/json",
+                           "X-Square-OpenAPI-Key": os.environ["BINANCE_SQUARE_OPENAPI_KEY"]},
+                  json={"bodyTextOnly": post_text}, timeout=30)
+              print(f"[square] {r.status_code} {r.text[:400]}")
+          else:
+              print("[mode] draft only - attach the chart image and post it manually.")
           PYEOF
-          python3 workflow.py
+
+      - name: Upload draft and chart
+        uses: actions/upload-artifact@v4
+        with:
+          name: square-draft-${{ github.run_number }}
+          path: out/
+          retention-days: 7
