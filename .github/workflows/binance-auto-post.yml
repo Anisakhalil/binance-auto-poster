@@ -1,40 +1,39 @@
-name: Binance Square Analyst Posts
+
+name: Binance Square Auto Post
 
 on:
   workflow_dispatch:
     inputs:
       post_mode:
-        description: "draft = sirf draft + chart artifact me save karo | live = Binance Square par asli post karo"
+        description: "Choose draft or live"
+        required: true
         type: choice
         options:
           - draft
           - live
-        default: live
-      max_delay_min:
-        description: "Posting se pehle max random delay (minutes). Test ke liye 0 rakho."
-        type: string
-        default: "45"
+        default: draft
   schedule:
-    # 4 posts/day (UTC). Har run me up to 45 min ka random wait bhi hota hai,
-    # is liye publish timing mechanical nahi lagti.
-    - cron: "0 6 * * *"
-    - cron: "1 10 * * *"
-    - cron: "0 14 * * *"
-    - cron: "0 18 * * *"
+    - cron: "0 6,10,14,18 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: square-poster
+  group: square-auto-post
   cancel-in-progress: false
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 10
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+      POST_MODE: ${{ github.event_name == 'schedule' && 'live' || inputs.post_mode || 'draft' }}
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -42,429 +41,122 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
-        run: pip install --quiet requests matplotlib mplfinance pandas numpy
+      - name: Install dependencies
+        run: pip install requests
 
-      - name: Restore run state
-        uses: actions/cache/restore@v4
-        with:
-          path: state
-          key: square-state-${{ github.run_number }}
-          restore-keys: |
-            square-state-
-
-      - name: Build and publish one post
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
-          GEMINI_MODEL: "gemini-2.5-flash"
-          POST_MODE: ${{ github.event.inputs.post_mode || 'live' }}
-          MAX_DELAY_MIN: ${{ github.event.inputs.max_delay_min || '45' }}
+      - name: Create and publish post
         run: |
-          mkdir -p out state
-          python3 - <<'PYEOF'
-          import os, json, math, random, time, datetime
+          python - <<'PY'
+          import os
+          import json
           import requests
-          import numpy as np
-          import pandas as pd
-          import matplotlib
-          matplotlib.use('Agg')
-          matplotlib.rcParams['text.parse_math'] = False
-          import matplotlib.pyplot as plt
-          import mplfinance as mpf
+          from pathlib import Path
 
-          API = 'https://data-api.binance.vision/api/v3'
-          OUT, STATE_DIR = 'out', 'state'
-          os.makedirs(OUT, exist_ok=True)
-          os.makedirs(STATE_DIR, exist_ok=True)
-
-          RUN = int(os.environ.get('GITHUB_RUN_NUMBER', '1'))
-          MODE = os.environ.get('POST_MODE', 'live').lower()
-          MODEL = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash')
-          try:
-              MAX_DELAY = int(os.environ.get('MAX_DELAY_MIN', '45'))
-          except Exception:
-              MAX_DELAY = 45
-          random.seed(RUN * 7919 + int(time.time() // 3600))
-
-          # ---------- state: pichli posts yaad rakho, repeat na ho ----------
-          STATE_FILE = f'{STATE_DIR}/state.json'
-          state = {'recent_syms': [], 'recent_styles': [], 'posted': 0, 'last_posted_utc': None}
-          try:
-              with open(STATE_FILE) as f:
-                  state.update(json.load(f))
-          except Exception:
-              pass
-
-          # ---------- 0. run ko spread karo taake timing mechanical na lage ----------
-          delay = random.randint(0, max(0, MAX_DELAY) * 60)
-          print(f'[0] run={RUN} mode={MODE} delay={delay // 60}m{delay % 60}s')
-          time.sleep(delay)
-
-          def fetch(path, **p):
-              r = requests.get(API + path, params=p, timeout=25)
-              r.raise_for_status()
-              return r.json()
-
-          # ---------- 1. live scan: sirf liquid USDT pairs, sirf asli crypto ----------
-          tickers = fetch('/ticker/24hr')
-          STABLES = {"USDC","FDUSD","TUSD","BUSD","DAI","EUR","USDP","PYUSD","AEUR","EURI","XUSD"}
-          LEVER = ("UP","DOWN","BULL","BEAR")
-          EXCLUDE = {"XAUT","PAXG","XAUM","SPCXB","SPYB","QQQB","TSLAB","NVDB","METAB",
-                     "GOOGLB","AMZNB","AAPLB","MSFTB","COINB","HOODB","CRCLB"}
-          cands, bup, bdn = [], 0, 0
-          for t in tickers:
-              sym = t.get('symbol', '')
-              if not sym.endswith('USDT'):
-                  continue
-              base = sym[:-4]
-              if base in STABLES or base in EXCLUDE or any(base.startswith(x) for x in LEVER):
-                  continue
-              try:
-                  price = float(t['lastPrice']); ch = float(t['priceChangePercent'])
-                  vol = float(t['quoteVolume']); hi = float(t['highPrice']); lo = float(t['lowPrice'])
-              except Exception:
-                  continue
-              if vol < 5_000_000:
-                  continue
-              if ch > 0: bup += 1
-              else: bdn += 1
-              if vol < 15_000_000 or abs(ch) < 1.2 or abs(ch) > 35:
-                  continue
-              cands.append(dict(sym=base, price=price, ch=ch, vol=vol, hi=hi, lo=lo))
-
-          cands.sort(key=lambda c: abs(c['ch']) * math.log10(c['vol'] / 1e6 + 1), reverse=True)
-          pool = cands[:30]
-          print(f'[1] pool={len(pool)}  breadth up={bup} down={bdn}')
-          if not pool:
-              print('[ERR] aaj koi candidate nahi mila'); raise SystemExit(0)
-
-          def rsi_series(s, n=14):
-              d = s.diff()
-              up = d.clip(lower=0).rolling(n).mean()
-              dn = (-d.clip(upper=0)).rolling(n).mean()
-              return 100 - 100 / (1 + up / dn.replace(0, np.nan))
-
-          def atr_series(df, n=14):
-              h, l, c = df['high'], df['low'], df['close']
-              tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-              return tr.rolling(n).mean()
-
-          DATA, rows = {}, []
-          for c in pool:
-              try:
-                  raw = fetch('/klines', symbol=c['sym'] + 'USDT', interval='1h', limit=240)
-              except Exception as e:
-                  print('  klines fail', c['sym'], str(e)[:80]); continue
-              if not raw or len(raw) < 160:
-                  continue
-              cols = ['time','open','high','low','close','volume','ct','qv','tr','tbb','tbq','ig']
-              df = pd.DataFrame(raw, columns=cols)
-              df['time'] = pd.to_datetime(df['time'], unit='ms')
-              df = df.set_index('time')[['open','high','low','close','volume']].astype(float)
-              df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-              df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-              df['rsi'] = rsi_series(df['close'])
-              df['atr'] = atr_series(df)
-
-              px = float(df['close'].iloc[-1])
-              e20 = float(df['ema20'].iloc[-1]); e50 = float(df['ema50'].iloc[-1])
-              r = float(df['rsi'].iloc[-1]); a = float(df['atr'].iloc[-1])
-              if not (px == px and r == r and a == a):
-                  continue
-              atrp = a / px * 100
-              if atrp < 0.6 or atrp > 9:
-                  continue
-
-              qv = df['close'] * df['volume']
-              last24 = float(qv.iloc[-24:].sum())
-              prev = qv.iloc[-120:-24]
-              avg24 = float(prev.mean() * 24) if len(prev) else float('nan')
-              surge = last24 / avg24 if avg24 == avg24 and avg24 > 0 else 1.0
-
-              slope = (e20 - float(df['ema20'].iloc[-13])) / float(df['ema20'].iloc[-13]) * 100
-
-              hi7 = float(df['high'].iloc[-168:].max()); lo7 = float(df['low'].iloc[-168:].min())
-              pos = (px - lo7) / (hi7 - lo7) if hi7 > lo7 else 0.5
-
-              if px > e20 > e50 and slope > 0.2:
-                  trend = 'up'
-              elif px < e20 < e50 and slope < -0.2:
-                  trend = 'down'
-              else:
-                  continue
-
-              if trend == 'up' and not (40 <= r <= 80):
-                  continue
-              if trend == 'down' and not (20 <= r <= 60):
-                  continue
-              if surge < 1.0:
-                  continue
-
-              rsi_fit = 1.2 if (45 <= r <= 72 or 28 <= r <= 55) else 0.85
-              ts = min(abs(slope) / 1.5, 3.0)
-              score = (abs(c['ch']) * math.log10(c['vol'] / 1e6 + 1)
-                       * min(max(surge, 1.0), 3.5) * (1 + ts) * rsi_fit)
-              rows.append(dict(sym=c['sym'], price=px, ch=c['ch'], vol=c['vol'], surge=surge,
-                               rsi=r, atrp=atrp, ema20=e20, ema50=e50, trend=trend, slope=slope,
-                               hi7=hi7, lo7=lo7, pos=pos, score=score))
-              DATA[c['sym']] = df
-
-          if not rows:
-              print('[ERR] abhi koi trendable coin nahi hai'); raise SystemExit(0)
-
-          rows.sort(key=lambda x: x['score'], reverse=True)
-
-          recent = set(state.get('recent_syms', [])[-4:])
-          fresh = [r for r in rows if r['sym'] not in recent]
-          ranked = fresh if fresh else rows
-
-          def fmt(v):
-              return f"{v:.2f}" if v >= 1 else f"{v:.6g}"
-
-          def levels(p):
-              p['entry'] = p['price']
-              if p['trend'] == 'up':
-                  p['bias'] = 'LONG'
-                  p['sl'] = min(p['ema50'], p['price'] - 1.5 * p['atrp'] / 100 * p['price'])
-                  p['tp1'] = max(p['hi7'], p['price'] * 1.02)
-                  p['tp2'] = p['tp1'] * 1.05
-              else:
-                  p['bias'] = 'SHORT'
-                  p['sl'] = max(p['ema50'], p['price'] + 1.5 * p['atrp'] / 100 * p['price'])
-                  p['tp1'] = min(p['lo7'], p['price'] * 0.98)
-                  p['tp2'] = p['tp1'] * 0.95
-              risk = abs(p['entry'] - p['sl'])
-              p['rr1'] = abs(p['tp1'] - p['entry']) / risk if risk > 0 else 0
-              p['rr2'] = abs(p['tp2'] - p['entry']) / risk if risk > 0 else 0
-              return p
-
-          ranked = [levels(p) for p in ranked]
-          good = [p for p in ranked if p['rr1'] >= 1.2]
-          picks = good[:3]
-          if len(picks) < 3:
-              for p in ranked:
-                  if p not in picks:
-                      picks.append(p)
-                  if len(picks) == 3:
-                      break
-          hero = picks[0]
-          print(f"[2] hero=${hero['sym']} {hero['bias']} ch={hero['ch']:+.2f}% "
-                f"surge={hero['surge']:.1f}x RSI={hero['rsi']:.1f} RR1={hero['rr1']:.2f}")
-          print('    backups:', [p['sym'] for p in picks[1:]])
-
-          # ---------- 2. chart: hero coin, asli levels, publication quality ----------
-          BG, GRID = '#0b0e14', '#1e2733'
-          UP, DN = '#26d782', '#f6465d'
-          EMA_F, EMA_S = '#ffd166', '#5eb0ff'
-
-          def mstyle():
-              mc = mpf.make_marketcolors(up=UP, down=DN, edge={'up': UP, 'down': DN},
-                                         wick={'up': UP, 'down': DN}, volume={'up': UP, 'down': DN})
-              return mpf.make_mpf_style(marketcolors=mc, base_mpl_style='dark_background',
-                                        gridcolor=GRID, gridstyle=':', y_on_right=True,
-                                        facecolor=BG, figcolor=BG,
-                                        rc={'axes.edgecolor': GRID, 'xtick.color': '#9fb0c0',
-                                            'ytick.color': '#9fb0c0', 'axes.labelcolor': '#c6d2de',
-                                            'text.color': '#e6edf3', 'axes.titlecolor': '#e6edf3'})
-
-          chart = f"{OUT}/chart.png"
-          d = DATA[hero['sym']].iloc[-96:]
-          title = (f"${hero['sym']}/USDT  1H  |  {fmt(hero['price'])}  |  24h {hero['ch']:+.2f}%  |  "
-                   f"vol {hero['surge']:.1f}x avg  |  {hero['bias']}")
-          fig, axl = mpf.plot(d, type='candle', style=mstyle(), volume=True,
-                              addplot=[mpf.make_addplot(d['ema20'], color=EMA_F, width=1.1),
-                                       mpf.make_addplot(d['ema50'], color=EMA_S, width=1.1)],
-                              hlines=dict(hlines=[hero['tp2'], hero['tp1'], hero['entry'], hero['sl']],
-                                          colors=[UP, UP, '#e6edf3', DN],
-                                          linestyle='--', linewidths=[0.9, 0.9, 1.1, 1.1]),
-                              title=title, returnfig=True, figsize=(12, 6.6))
-          axl[0].text(0.995, 0.015, 'Educational analysis  |  Not financial advice',
-                      transform=axl[0].transAxes, ha='right', va='bottom',
-                      color='#5b6b7c', fontsize=8)
-          fig.savefig(chart, dpi=120, bbox_inches='tight', facecolor=BG)
-          plt.close(fig)
-          print(f"[3] chart {chart} {os.path.getsize(chart) // 1024}KB")
-
-          compare = None
-          if len(picks) >= 2:
-              compare = f"{OUT}/chart_compare.png"
-              fig, ax = plt.subplots(figsize=(12, 6.0), facecolor=BG); ax.set_facecolor(BG)
-              for pp, col in zip(picks, ['#ffd166', '#5eb0ff', '#c792ea']):
-                  dd = DATA[pp['sym']].iloc[-120:]
-                  norm = dd['close'] / dd['close'].iloc[0] * 100 - 100
-                  ax.plot(norm.index, norm.values, color=col, lw=2.0,
-                          label=f"${pp['sym']}  ({pp['ch']:+.2f}% 24h)")
-              ax.axhline(0, color=GRID, lw=1)
-              ax.set_title('Last 5 days - % move comparison', color='#e6edf3', fontsize=12)
-              ax.grid(color=GRID, ls=':', lw=0.7)
-              ax.legend(facecolor=BG, edgecolor=GRID, labelcolor='#e6edf3')
-              for s in ax.spines.values(): s.set_color(GRID)
-              ax.tick_params(colors='#9fb0c0')
-              fig.tight_layout(); fig.savefig(compare, dpi=120, facecolor=BG); plt.close(fig)
-
-          # ---------- 3. post style rotate karo ----------
-          STYLES = ['deep_dive', 'level_breakdown', 'two_coin_compare',
-                    'market_read', 'narrative', 'question_hook']
-          recent_styles = state.get('recent_styles', [])[-3:]
-          avail = [s for s in STYLES if s not in recent_styles] or STYLES
-          if len(picks) < 2:
-              one_coin = ('deep_dive', 'level_breakdown', 'market_read', 'narrative')
-              avail = [s for s in avail if s in one_coin] or ['deep_dive']
-          style = random.choice(avail)
-          print(f'[4] style={style}')
-
-          coins_block = "\n".join(
-              f"${p['sym']}: spot={fmt(p['price'])}, 24h={p['ch']:+.2f}%, volume=${p['vol'] / 1e6:.0f}M, "
-              f"volume_vs_own_avg={p['surge']:.1f}x, RSI14={p['rsi']:.1f}, EMA20={fmt(p['ema20'])}, "
-              f"EMA50={fmt(p['ema50'])}, trend={p['trend']}, 7d_high={fmt(p['hi7'])}, 7d_low={fmt(p['lo7'])}, "
-              f"range_position={p['pos'] * 100:.0f}%, bias={p['bias']}, entry={fmt(p['entry'])}, "
-              f"invalidation={fmt(p['sl'])}, target1={fmt(p['tp1'])}, target2={fmt(p['tp2'])}, "
-              f"reward_risk_1={p['rr1']:.1f}"
-              for p in picks)
-
-          prompt = (
-            "You are a senior crypto analyst writing ONE post for Binance Square. "
-            "Your reader is a retail trader who is tired of bot-written posts.\n\n"
-            f"POST TYPE: {style}\n"
-            f"MARKET BREADTH (Binance USDT pairs): {bup} up / {bdn} down in the last 24h.\n"
-            "LIVE DATA - use ONLY these numbers, never invent, round or extrapolate a price:\n"
-            f"{coins_block}\n\n"
-            "WRITE IT LIKE THIS:\n"
-            "1. HOOK: one short line naming the coin and its single most interesting fact. "
-            "No 'gm', no 'hello traders', no 'let's dive in'. Never reuse a hook from a previous post.\n"
-            "2. MARKET: 1-2 lines using the breadth number.\n"
-            "3. THE SETUP: hero coin - spot, 24h move, volume vs its own average, RSI, trend in plain words.\n"
-            "4. THE LEVELS: entry, invalidation, target 1 and target 2 - and say WHY each level exists "
-            "(7d high, EMA50, last higher low, etc).\n"
-            "5. THE EDGE: one reusable insight the reader can apply to any coin (risk sizing, "
-            "invalidation logic, volume confirmation). This is what makes people follow you.\n"
-            "6. QUESTION: end with one genuine question that invites replies.\n\n"
-            "HARD RULES:\n"
-            "- Cashtags always with a dollar sign, e.g. $BTC.\n"
-            "- 700 to 950 characters total. Short lines. Plain text - no markdown, no headers, "
-            "no symbols other than '- '.\n"
-            "- Call the levels educational scenarios, not signals, and never imply certainty.\n"
-            "- State the invalidation clearly: if it closes beyond that level the idea is dead.\n"
-            "- Mixed Roman Urdu + English is welcome, but keep it readable.\n"
-            "- Final two lines must be exactly: 'DYOR - not financial advice.' and then 3-4 hashtags.\n"
-            "- Mention that AI tools assisted the draft.\n"
-            "- BANNED words: guaranteed, guarantee, risk free, risk-free, sure profit, assured profit, "
-            "no loss, pakka, 100% profit, 24h watchlist, to the moon, 100x, free money, don't miss, "
-            "next bitcoin, life changing.\n"
-            "- Never promise, imply or hint at any profit."
+          gemini_key = os.environ.get("GEMINI_API_KEY", "")
+          square_key = os.environ.get(
+              "BINANCE_SQUARE_OPENAPI_KEY", ""
           )
+          mode = os.environ.get("POST_MODE", "draft").lower()
 
-          post_text = None
-          for attempt in (1, 2):
-              try:
-                  gurl = ("https://generativelanguage.googleapis.com/v1beta/models/"
-                          f"{MODEL}:generateContent?key=" + os.environ.get("GEMINI_API_KEY", ""))
-                  gr = requests.post(gurl, json={
-                      "contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 1.0, "maxOutputTokens": 1400}
-                  }, timeout=60)
-                  if gr.ok:
-                      post_text = gr.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                      break
-                  print('[gemini]', gr.status_code, gr.text[:250])
-              except Exception as e:
-                  print('[gemini] err:', str(e)[:200])
-              time.sleep(6 * attempt)
+          if not gemini_key:
+              raise SystemExit("Missing GEMINI_API_KEY secret")
 
-          # ---------- 4. compliance guard ----------
-          BANNED = ['guaranteed', 'guarantee', 'risk free', 'risk-free', 'sure profit',
-                    'assured profit', 'no loss', 'pakka', '100% profit', '24h watchlist',
-                    'to the moon', '100x', 'free money', "don't miss", 'next bitcoin',
-                    'life changing', 'guaranteed profit']
-          if post_text:
-              low = post_text.lower()
-              if any(b in low for b in BANNED):
-                  print('[guard] banned phrase mila -> template par fallback')
-                  post_text = None
-              elif len(post_text) < 350:
-                  print('[guard] draft bohat chhota hai -> template par fallback')
-                  post_text = None
+          prices = []
+          for symbol in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]:
+              r = requests.get(
+                  "https://api.binance.com/api/v3/ticker/24hr",
+                  params={"symbol": symbol},
+                  timeout=20
+              )
+              r.raise_for_status()
+              d = r.json()
+              prices.append(
+                  f"{symbol}: price={d['lastPrice']}, "
+                  f"24h change={d['priceChangePercent']}%"
+              )
 
-          if not post_text:
-              L = []
-              L.append(f"${hero['sym']} is the cleanest trend on the board right now - 24h {hero['ch']:+.2f}%.")
-              L.append(f"Breadth check: {bup} coins up / {bdn} down in the last 24h.")
-              L.append("")
-              L.append(f"${hero['sym']} - {hero['bias']} scenario")
-              L.append(f"- spot {fmt(hero['price'])} | volume {hero['surge']:.1f}x its own average | RSI14 {hero['rsi']:.1f}")
-              L.append(f"- EMA20 {fmt(hero['ema20'])} | EMA50 {fmt(hero['ema50'])} | trend {hero['trend']}")
-              L.append(f"- entry {fmt(hero['entry'])} | invalidation {fmt(hero['sl'])}")
-              L.append(f"- target 1 {fmt(hero['tp1'])} | target 2 {fmt(hero['tp2'])} | reward:risk {hero['rr1']:.1f}")
-              L.append("")
-              L.append("The edge: a level only matters if it invalidates the idea. If price closes beyond "
-                       "the invalidation, the setup is dead - no averaging, no hoping.")
-              L.append("")
-              L.append("Which level are you watching on this one?")
-              L.append("")
-              L.append("DYOR - not financial advice.")
-              L.append("#Crypto #BinanceSquare #Altcoins #Trading")
-              L.append("(Educational scenario, not a signal. Draft prepared with AI assistance, reviewed by me.)")
-              post_text = "\n".join(L)
+          market = "\n".join(prices)
+          prompt = f"""
+          Write one concise, original English Binance Square
+          crypto market analysis post using this live market data.
 
-          with open(f'{OUT}/draft.md', 'w') as f:
-              f.write(post_text)
-          with open(f'{OUT}/picks.json', 'w') as f:
-              json.dump(picks, f, indent=1, default=str)
+          {market}
 
-          print('\n=== DRAFT ===\n' + post_text)
-          print(f"\nchars={len(post_text)}  style={style}  hero=${hero['sym']}  chart={chart}")
+          Explain the observed market moves without inventing
+          support/resistance levels or predicting guaranteed profits.
+          Keep it under 900 characters. Include a brief educational
+          disclaimer. Output only the post text.
+          """
 
-          # ---------- 5. publish (text only) ----------
-          posted = False
-          if MODE == 'live':
-              key = os.environ.get('BINANCE_SQUARE_OPENAPI_KEY', '').strip()
-              if not key:
-                  print('[square] BINANCE_SQUARE_OPENAPI_KEY missing -> draft only')
+          url = (
+              "https://generativelanguage.googleapis.com/"
+              "v1beta/models/gemini-2.5-flash:generateContent"
+          )
+          r = requests.post(
+              url,
+              params={"key": gemini_key},
+              json={"contents": [{"parts": [{"text": prompt}]}]},
+              timeout=60
+          )
+          r.raise_for_status()
+          data = r.json()
+          post = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+          if not post:
+              raise SystemExit("Gemini returned an empty post")
+
+          Path("out").mkdir(exist_ok=True)
+          Path("out/draft.txt").write_text(post, encoding="utf-8")
+
+          print("Generated post:\n" + post)
+          print("Selected mode:", mode)
+
+          if mode == "draft":
+              print("Draft saved to out/draft.txt; not published.")
+          elif mode == "live":
+              if not square_key:
+                  raise SystemExit(
+                      "Missing BINANCE_SQUARE_OPENAPI_KEY secret"
+                  )
+
+              r = requests.post(
+                  "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add",
+                  headers={
+                      "X-Square-OpenAPI-Key": square_key,
+                      "Content-Type": "application/json",
+                      "clienttype": "binanceSkill"
+                  },
+                  json={"bodyTextOnly": post},
+                  timeout=30
+              )
+              r.raise_for_status()
+              result = r.json()
+
+              if result.get("code") != "000000":
+                  raise SystemExit(
+                      "Binance rejected post: "
+                      + str(result.get("code"))
+                      + " "
+                      + str(result.get("message"))
+                  )
+
+              post_id = result.get("data", {}).get("id")
+              if post_id:
+                  print(
+                      "POST PUBLISHED: "
+                      + "https://www.binance.com/square/post/"
+                      + str(post_id)
+                  )
               else:
-                  url = "https://www.binance.com/bapi/composite/v1/public/pgc/openApi/content/add"
-                  for attempt in (1, 2, 3):
-                      try:
-                          r = requests.post(url, timeout=30,
-                              headers={"Content-Type": "application/json",
-                                       "X-Square-OpenAPI-Key": key},
-                              json={"bodyTextOnly": post_text})
-                          print(f"[square] attempt {attempt}: {r.status_code} {r.text[:300]}")
-                          if r.ok:
-                              posted = True
-                              break
-                      except Exception as e:
-                          print(f"[square] attempt {attempt} error:", str(e)[:200])
-                      time.sleep(8 * attempt)
-              if not posted:
-                  print('[square] publish nahi hua - draft aur chart artifact me mojood hain')
+                  print("API reported success; post ID unavailable.")
           else:
-              print('[mode] draft only - chart.png attach karke manually post karo.')
+              raise SystemExit("Invalid POST_MODE")
+          PY
 
-          # ---------- 6. state save ----------
-          state['recent_syms'] = (state.get('recent_syms', []) + [hero['sym']])[-8:]
-          state['recent_styles'] = (state.get('recent_styles', []) + [style])[-6:]
-          if posted:
-              state['posted'] = int(state.get('posted', 0)) + 1
-              state['last_posted_utc'] = datetime.datetime.utcnow().isoformat(timespec='seconds')
-          with open(STATE_FILE, 'w') as f:
-              json.dump(state, f, indent=1)
-          print('[5] state saved:', state['recent_syms'])
-          print(f"[6] total posted so far: {state.get('posted', 0)}")
-          print('done.')
-          PYEOF
-
-      - name: Upload draft and chart
-        if: always()
+      - name: Save draft artifact
+        if: success() && (github.event_name == 'workflow_dispatch' && inputs.post_mode == 'draft')
         uses: actions/upload-artifact@v4
         with:
-          name: square-post-${{ github.run_number }}
-          path: out/
-          retention-days: 14
-
-      - name: Save run state
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: state
-          key: square-state-${{ github.run_number }}
+          name: binance-square-draft
+          path: out/draft.txt
+          if-no-files-found: error
