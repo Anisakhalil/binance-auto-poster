@@ -13,7 +13,7 @@ on:
           - live
         default: draft
   schedule:
-    - cron: "0 6,10,14,18 * * *"
+    - cron: "0 6,10,14,17 * * *"
 
 permissions:
   contents: read
