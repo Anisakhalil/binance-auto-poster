@@ -18,7 +18,7 @@ on:
     # 4 posts/day (UTC). Har run me up to 45 min ka random wait bhi hota hai,
     # is liye publish timing mechanical nahi lagti.
     - cron: "0 6 * * *"
-    - cron: "0 10 * * *"
+    - cron: "1 10 * * *"
     - cron: "0 14 * * *"
     - cron: "0 18 * * *"
 
