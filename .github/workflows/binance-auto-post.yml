@@ -1,301 +1,94 @@
+name: Binance Square Direct Poster
 
-name: Binance Square Auto Poster
+# Is file ko yahan rakho:  .github/workflows/square.yml
 
 on:
   workflow_dispatch:
     inputs:
       post_mode:
-        description: "Test draft or publish a real post"
+        description: "live = seedha Binance Square par post karo | draft = sirf files save karo"
+        required: false
+        default: "live"
         type: choice
         options:
-          - draft
           - live
-        default: draft
+          - draft
+
   schedule:
-    - cron: "0 6 * * *"
-    - cron: "0 10 * * *"
-    - cron: "0 14 * * *"
-    - cron: "0 18 * * *"
+    # GitHub cron HAMESHA UTC hota hai. IST = UTC + 5:30.
+    - cron: "13 0 * * *"    # 00:13 UTC = 05:43 IST — Asia session open (Tokyo volume shuru)
+    - cron: "11 8 * * *"    # 08:11 UTC = 13:41 IST — London session open
+    - cron: "37 13 * * *"   # 13:37 UTC = 19:07 IST — London-New York overlap (sab se bara volume window)
+    - cron: "53 16 * * *"   # 16:53 UTC = 22:23 IST — US session (NY afternoon peak)
 
 permissions:
   contents: read
 
 concurrency:
-  group: square-poster
+  group: binance-square-poster
   cancel-in-progress: false
 
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install dependency
-        run: pip install requests
-
-      - name: Generate market post
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: gemini-2.5-flash
+      - name: Install Python deps
         run: |
-          mkdir -p out
-          python - <<'PY'
-          import os, sys, json, requests
+          python -m pip install --upgrade pip
+          pip install --quiet -r requirements.txt
 
-          # Public market-data source; no Binance market API needed.
-          url = "https://api.coingecko.com/api/v3/coins/markets"
-          params = {
-              "vs_currency": "usd",
-              "ids": "bitcoin,ethereum,binancecoin,solana",
-              "price_change_percentage": "24h"
-          }
+      - name: Offline selftest (endpoint + payload check)
+        run: python square_post.py --selftest
 
-          try:
-              r = requests.get(url, params=params, timeout=20)
-              r.raise_for_status()
-              coins = r.json()
-          except Exception as e:
-              sys.exit("Market-data request failed: " + str(e)[:250])
-
-          if not isinstance(coins, list) or len(coins) < 3:
-              sys.exit("Insufficient market data; no post generated.")
-
-          rows = []
-          for c in coins:
-              price = c.get("current_price")
-              change = c.get("price_change_percentage_24h")
-              volume = c.get("total_volume")
-              if price is None or change is None or volume is None:
-                  continue
-              rows.append(
-                  f"{c['name']} ({c['symbol'].upper()}): "
-                  f"price=${price}, 24h change={change:.2f}%, "
-                  f"24h volume=${volume}"
-              )
-
-          if len(rows) < 3:
-              sys.exit("Incomplete market data; refusing to invent values.")
-
-          market = "\n".join(rows)
-          key = os.environ.get("GEMINI_API_KEY", "").strip()
-          if not key:
-              sys.exit("GEMINI_API_KEY secret is missing.")
-
-          model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-          endpoint = (
-              "https://generativelanguage.googleapis.com/v1beta/models/"
-              + model + ":generateContent"
-          )
-
-          prompt = f"""
-          Write one original Binance Square crypto market-analysis post.
-
-          Use ONLY these supplied facts:
-          {market}
-
-          Rules:
-          - Write naturally in simple English.
-          - Explain one interesting comparison across the coins.
-          - Explain one limitation of interpreting 24-hour price changes.
-          - Give one practical risk-management lesson.
-          - End with a genuine question for readers.
-          - Add 2-3 relevant hashtags.
-          - State: Educational content, not financial advice.
-          - No fabricated news, predictions presented as facts,
-            guaranteed returns, or promises of earnings.
-          - Do not invent prices, indicators, or statistics.
-          - Aim for 600-900 characters.
-          - Return only the post text.
-          """
-
-          try:
-              response = requests.post(
-                  endpoint,
-                  params={"key": key},
-                  json={
-                      "contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {
-                          "temperature": 0.7,
-                          "maxOutputTokens": 700
-                      }
-                  },
-                  timeout=45
-              )
-              response.raise_for_status()
-              data = response.json()
-              text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-          except Exception as e:
-              sys.exit("Gemini generation failed: " + str(e)[:300])
-
-          if len(text) < 200 or len(text) > 2000:
-              sys.exit("Generated post length invalid; refusing to publish.")
-
-          os.makedirs("out", exist_ok=True)
-          with open("out/post.txt", "w", encoding="utf-8") as f:
-              f.write(text)
-          with open("out/market-data.txt", "w", encoding="utf-8") as f:
-              f.write(market)
-
-          print("Post generated successfully.")
-          print("Character count:", len(text))
-          print(text)
-          PY
-
-      - name: Publish to Binance Square
-        env:
-          SQUARE_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
-          POST_MODE: ${{ github.event.inputs.post_mode || 'live' }}
-        run: |
-          python - <<'PY'
-          import os, sys, json, requests
-
-          mode = os.environ.get("POST_MODE", "live").lower()
-          with open("out/post.txt", encoding="utf-8") as f:
-              text = f.read().strip()
-
-          if mode == "draft":
-              print("DRAFT TEST SUCCESS: content generated; not published.")
-              sys.exit(0)
-
-          if mode != "live":
-              sys.exit("Invalid posting mode.")
-
-          key = os.environ.get("SQUARE_KEY", "").strip()
-          if not key:
-              sys.exit("Missing BINANCE_SQUARE_OPENAPI_KEY GitHub secret.")
-
-          url = (
-              "https://www.binance.com/"
-              "bapi/composite/v1/public/pgc/openApi/content/add"
-          )
-
-          try:
-              response = requests.post(
-                  url,
-                  headers={
-                      "Content-Type": "application/json",
-                      "clienttype": "binanceSkill",
-                      "X-Square-OpenAPI-Key": key
-                  },
-                  json={"bodyTextOnly": text},
-                  timeout=35
-              )
-              print("HTTP status:", response.status_code)
-              response.raise_for_status()
-              result = response.json()
-          except Exception as e:
-              sys.exit("Publishing request failed: " + str(e)[:300])
-
-          code = str(result.get("code", ""))
-          message = result.get("message")
-          data = result.get("data") or {}
-
-          if code != "000000":
-              sys.exit(
-                  "Binance rejected post. API code="
-                  + code + "; message=" + str(message)[:300]
-              )
-
-          post_id = data.get("id")
-          if post_id:
-              print("PUBLISH SUCCESS")
-              print("Post ID:", post_id)
-              print("Post URL: https://www.binance.com/square/post/" + str(post_id))
-          else:
-              print("API returned success but no post ID.")
-              print("Check Binance Square before retrying.")
-          PY
-
-      - name: Save generated post artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: square-post-${{ github.run_number }}
-          path: out/
-          if-no-files-found: warn
-          retention-days: 14
-
-                  "generationConfig": {
-                      "temperature": 0.8,
-                      "maxOutputTokens": 700
-                  }
-              },
-              timeout=60
-          )
-          response.raise_for_status()
-          data = response.json()
-
-          try:
-              text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-          except (KeyError, IndexError, TypeError):
-              sys.exit("Gemini returned no usable post.")
-
-          if len(text) < 200 or len(text) > 2000:
-              sys.exit("Post length invalid; refusing to publish.")
-
-          os.makedirs("out", exist_ok=True)
-          with open("out/post.txt", "w", encoding="utf-8") as f:
-              f.write(text)
-
-          with open("out/market-data.txt", "w", encoding="utf-8") as f:
-              f.write(market)
-
-          print("Post generated. Characters:", len(text))
-          print(text)
-          PY
-
-      - name: Publish or save draft
+      - name: Direct post to Binance Square
         env:
           BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: "gemini-2.5-flash"
           POST_MODE: ${{ github.event.inputs.post_mode || 'live' }}
-          MAX_DELAY_MIN: ${{ github.event.inputs.max_delay_min || '5' }}
+          POST_IMAGE: "true"
+          MAX_START_DELAY_MIN: "8"    # 0-8 min random jitter — bot-pattern flag se bachne ke liye
+          OUT_DIR: "out"
+        run: python square_post.py
+
+      - name: Show draft + result
+        if: always()
         run: |
-          set -euo pipefail
+          echo "----- out/draft.md -----"
+          cat out/draft.md 2>/dev/null || echo "(no draft)"
+          echo "----- out/result.json -----"
+          cat out/result.json 2>/dev/null || echo "(no result — draft mode ya koi error)"
+          echo "----- files -----"
+          ls -la out 2>/dev/null || true
 
-          MODE="$POST_MODE"
-          if [ "$MODE" != "draft" ] && [ "$MODE" != "live" ]; then
-            echo "Invalid post mode."
-            exit 1
-          fi
-
-          if [ "$MODE" = "draft" ]; then
-            echo "Draft saved. No post was published."
-            exit 0
-          fi
-
-          if [ -z "${BINANCE_SQUARE_OPENAPI_KEY:-}" ]; then
-            echo "ERROR: Binance Square API key secret is missing."
-            exit 1
-          fi
-
-          DELAY="${MAX_DELAY_MIN:-5}"
-          if ! [[ "$DELAY" =~ ^[0-9]+$ ]] || [ "$DELAY" -gt 30 ]; then
-            echo "Delay must be a number from 0 to 30."
-            exit 1
-          fi
-
-          if [ "$DELAY" -gt 0 ]; then
-            python -c "import random,time; time.sleep(random.randint(0,$DELAY)*60)"
-          fi
-
-          cd /tmp/binance-skills-hub/skills/binance/square-post
-
-          node scripts/post-text.mjs \
-            --text "$(cat "$GITHUB_WORKSPACE/out/post.txt)"
-
-      - name: Upload generated post
+      - name: Upload draft + chart artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: square-post-${{ github.run_number }}
           path: out/
+          retention-days: 7
           if-no-files-found: warn
-          retention-days: 14
+
+  # KEEPALIVE: GitHub 60 din tak repo mein koi activity na hone par scheduled
+  # workflows khud disable kar deta hai. Yeh job hafte mein ek baar repo ko
+  # "active" rakhta hai, taake bot kabhi band na ho.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Keep repo active (60-day auto-disable se bachao)
+        uses: gautamkrishnar/keepalive-workflow@v2
