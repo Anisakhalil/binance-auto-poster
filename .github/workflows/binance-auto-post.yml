@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       post_mode:
-        description: "Draft ya live post"
+        description: "Test draft first, then live"
         required: true
         type: choice
         options:
@@ -43,7 +43,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           mkdir -p out
-
           python - <<'PY'
           import os
           import sys
@@ -54,115 +53,125 @@ jobs:
               sys.exit(1)
 
           key = os.environ.get("GEMINI_API_KEY", "").strip()
-          model = os.environ.get(
-              "GEMINI_MODEL", "gemini-3.8-flash"
-          )
+          model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
           if not key:
               fail("GEMINI_API_KEY secret is missing.")
 
-          url = (
-              "https://api.coingecko.com/api/v3/coins/markets"
-          )
-          params = {
-              "vs_currency": "usd",
-              "ids": "bitcoin,ethereum,binancecoin,solana",
-              "price_change_percentage": "24h"
-          }
-
           try:
-              response = requests.get(
-                  url, params=params, timeout=25
+              r = requests.get(
+                  "https://api.coingecko.com/api/v3/coins/markets",
+                  params={
+                      "vs_currency": "usd",
+                      "ids": "bitcoin,ethereum,binancecoin,solana",
+                      "price_change_percentage": "24h"
+                  },
+                  timeout=25
               )
-              response.raise_for_status()
-              coins = response.json()
+              r.raise_for_status()
+              coins = r.json()
           except Exception as e:
-              fail("CoinGecko market request failed: " + str(e))
+              fail("Market data request failed: " + str(e))
 
           if not isinstance(coins, list) or len(coins) < 3:
               fail("Market data is incomplete.")
 
           rows = []
-          for coin in coins:
-              price = coin.get("current_price")
-              change = coin.get("price_change_percentage_24h")
-              volume = coin.get("total_volume")
-
+          for c in coins:
+              price = c.get("current_price")
+              change = c.get("price_change_percentage_24h")
+              volume = c.get("total_volume")
               if price is None or change is None:
                   continue
-
               rows.append(
-                  f"{coin.get('name')} ({coin.get('symbol', '').upper()}): "
-                  f"price=${price}, 24h change={change:.2f}%, "
-                  f"volume=${volume}"
+                  f"{c.get('name')} ({c.get('symbol', '').upper()}): "
+                  f"${price}, 24h change {change:.2f}%, "
+                  f"volume ${volume}"
               )
 
           if len(rows) < 3:
               fail("Not enough valid market data.")
 
           market = "\n".join(rows)
+          url = (
+              "https://generativelanguage.googleapis.com/"
+              f"v1beta/models/{model}:generateContent"
+          )
 
           prompt = f"""
-          Write one original Binance Square crypto market analysis
-          in English, approximately 600-900 characters.
-
-          Use the market data below accurately. Explain the market
-          mood, compare the listed assets, and mention what traders
-          should watch next. Include balanced risk management advice.
-          Do not invent prices, news, indicators, or guarantees.
-          Do not promise profits. Use a clear title, short paragraphs,
-          and 3-5 relevant hashtags. Return only the post text.
+          Write an original Binance Square crypto market post in English.
+          Target length: 600 to 900 characters, excluding no content.
+          Include a clear title, market analysis based only on the data,
+          what traders should watch, a risk warning, and 3 relevant hashtags.
+          Use short paragraphs. Do not invent news or indicators.
+          Never promise profits. Return only the complete post text.
 
           MARKET DATA:
           {market}
           """
 
-          api_url = (
-              "https://generativelanguage.googleapis.com/"
-              f"v1beta/models/{model}:generateContent"
-          )
-
-          try:
-              response = requests.post(
-                  api_url,
-                  headers={
-                      "x-goog-api-key": key,
-                      "Content-Type": "application/json"
-                  },
-                  json={
-                      "contents": [{
-                          "parts": [{"text": prompt}]
-                      }],
-                      "generationConfig": {
-                          "temperature": 0.7,
-                          "maxOutputTokens": 700
-                      }
-                  },
-                  timeout=60
-              )
-
-              if not response.ok:
-                  fail(
-                      f"Gemini API HTTP {response.status_code}: "
-                      + response.text[:1200]
+          text = ""
+          for attempt in range(2):
+              try:
+                  r = requests.post(
+                      url,
+                      headers={
+                          "x-goog-api-key": key,
+                          "Content-Type": "application/json"
+                      },
+                      json={
+                          "contents": [{
+                              "parts": [{"text": prompt}]
+                          }],
+                          "generationConfig": {
+                              "temperature": 0.7,
+                              "maxOutputTokens": 900
+                          }
+                      },
+                      timeout=60
                   )
 
-              data = response.json()
-              text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                  if not r.ok:
+                      fail(
+                          f"Gemini API HTTP {r.status_code}: "
+                          + r.text[:1000]
+                      )
 
-          except SystemExit:
-              raise
-          except Exception as e:
-              fail("Gemini generation failed: " + str(e))
+                  data = r.json()
+                  text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-          if len(text) < 200 or len(text) > 2000:
+              except SystemExit:
+                  raise
+              except Exception as e:
+                  fail("Gemini generation failed: " + str(e))
+
+              if len(text) >= 300:
+                  break
+
+              prompt = f"""
+              Your previous response was too short.
+              Write a complete original English crypto market post
+              between 600 and 900 characters. Include a title,
+              analysis of the supplied data, trader watchpoints,
+              a risk warning, and 3 hashtags.
+              Do not invent facts or promise profits.
+              Return only the post text.
+
+              MARKET DATA:
+              {market}
+              """
+
+          if len(text) < 80:
               fail(
-                  f"Generated post length invalid: {len(text)} characters."
+                  f"Generated text is too short ({len(text)} characters)."
               )
 
+          if len(text) > 2000:
+              fail("Generated post exceeds 2000 characters.")
+
+          os.makedirs("out", exist_ok=True)
           with open("out/post.txt", "w", encoding="utf-8") as f:
               f.write(text)
-
           with open("out/market-data.txt", "w", encoding="utf-8") as f:
               f.write(market)
 
@@ -172,7 +181,7 @@ jobs:
           PY
 
       - name: Publish to Binance Square
-        if: ${{ (github.event_name == 'schedule' || inputs.post_mode == 'live') }}
+        if: ${{ github.event_name == 'schedule' || inputs.post_mode == 'live' }}
         env:
           BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
         run: |
@@ -186,9 +195,7 @@ jobs:
           ).strip()
 
           if not key:
-              sys.exit(
-                  "BINANCE_SQUARE_OPENAPI_KEY secret is missing."
-              )
+              sys.exit("BINANCE_SQUARE_OPENAPI_KEY secret is missing.")
 
           with open("out/post.txt", encoding="utf-8") as f:
               post_text = f.read().strip()
@@ -199,7 +206,7 @@ jobs:
           )
 
           try:
-              response = requests.post(
+              r = requests.post(
                   url,
                   headers={
                       "Content-Type": "application/json",
@@ -209,19 +216,14 @@ jobs:
                   json={"bodyTextOnly": post_text},
                   timeout=30
               )
-
-              print("Binance HTTP status:", response.status_code)
-              response.raise_for_status()
-              result = response.json()
-
+              print("Binance HTTP status:", r.status_code)
+              r.raise_for_status()
+              result = r.json()
           except Exception as e:
               sys.exit("Binance publishing request failed: " + str(e))
 
           if str(result.get("code")) != "000000":
-              sys.exit(
-                  "Binance rejected the post: "
-                  + str(result)[:1500]
-              )
+              sys.exit("Binance rejected the post: " + str(result)[:1200])
 
           print("Binance Square accepted the post.")
           print("Response:", result)
