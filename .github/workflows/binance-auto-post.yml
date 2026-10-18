@@ -1,7 +1,5 @@
 name: Binance Square Direct Poster
 
-# Is file ko yahan rakho:  .github/workflows/square.yml
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,14 +13,13 @@ on:
           - draft
 
   schedule:
-    # GitHub cron HAMESHA UTC hota hai. IST = UTC + 5:30.
-    - cron: "13 0 * * *"    # 00:13 UTC = 05:43 IST — Asia session open (Tokyo volume shuru)
+    - cron: "13 0 * * *"    # 00:13 UTC = 05:43 IST — Asia session open
     - cron: "11 8 * * *"    # 08:11 UTC = 13:41 IST — London session open
-    - cron: "37 13 * * *"   # 13:37 UTC = 19:07 IST — London-New York overlap (sab se bara volume window)
-    - cron: "53 16 * * *"   # 16:53 UTC = 22:23 IST — US session (NY afternoon peak)
+    - cron: "37 13 * * *"   # 13:37 UTC = 19:07 IST — London–NY overlap (sab se zyada volume)
+    - cron: "53 16 * * *"   # 16:53 UTC = 22:23 IST — US session peak
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: binance-square-poster
@@ -58,7 +55,7 @@ jobs:
           GEMINI_MODEL: "gemini-2.5-flash"
           POST_MODE: ${{ github.event.inputs.post_mode || 'live' }}
           POST_IMAGE: "true"
-          MAX_START_DELAY_MIN: "8"    # 0-8 min random jitter — bot-pattern flag se bachne ke liye
+          MAX_START_DELAY_MIN: "8"
           OUT_DIR: "out"
         run: python square_post.py
 
@@ -68,7 +65,7 @@ jobs:
           echo "----- out/draft.md -----"
           cat out/draft.md 2>/dev/null || echo "(no draft)"
           echo "----- out/result.json -----"
-          cat out/result.json 2>/dev/null || echo "(no result — draft mode ya koi error)"
+          cat out/result.json 2>/dev/null || echo "(no result)"
           echo "----- files -----"
           ls -la out 2>/dev/null || true
 
@@ -81,14 +78,21 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-  # KEEPALIVE: GitHub 60 din tak repo mein koi activity na hone par scheduled
-  # workflows khud disable kar deta hai. Yeh job hafte mein ek baar repo ko
-  # "active" rakhta hai, taake bot kabhi band na ho.
+  # ============================================================================
+  # KEEPALIVE — FIX: external action hata diya. Self-contained git push.
+  # [skip ci] -> infinite loop nahi banega.
+  # GitHub 60 din inactivity par scheduled workflows disable karta hai;
+  # yeh empty commit har Monday push karke repo ko "active" rakhta hai.
+  # ============================================================================
   keepalive:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Keep repo active (60-day auto-disable se bachao)
-        uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Empty commit (60-day auto-disable se bachao)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: scheduled keepalive [skip ci]"
+          git push
