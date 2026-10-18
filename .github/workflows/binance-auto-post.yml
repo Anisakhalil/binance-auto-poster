@@ -1,239 +1,87 @@
 
-name: Binance Square Auto Poster
+name: Binance Square Quality Posts
 
 on:
+  schedule:
+    # Pakistan time: 06:17, 14:17, 22:17
+    - cron: "17 1 * * *"
+    - cron: "17 9 * * *"
+    - cron: "17 17 * * *"
+
   workflow_dispatch:
     inputs:
-      post_mode:
-        description: "Test draft first, then live"
+      slot:
+        description: "1 = BTC market, 2 = trending coin, 3 = technical setup"
         required: true
+        default: "1"
         type: choice
         options:
-          - draft
-          - live
-        default: draft
-  schedule:
-    - cron: "0 6,10,14,18 * * *"
+          - "1"
+          - "2"
+          - "3"
 
 permissions:
   contents: read
 
+concurrency:
+  group: binance-square-quality-posts
+  cancel-in-progress: false
+
 jobs:
-  post:
+  publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
 
     env:
-      GEMINI_MODEL: gemini-3.8-flash
+      BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: gemini-2.5-flash
+      SLOT: ${{ inputs.slot || '' }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: python -m pip install requests
-
-      - name: Generate market post
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      - name: Install Python dependencies
         run: |
-          mkdir -p out
-          python - <<'PY'
-          import os
-          import sys
-          import requests
+          python -m pip install --upgrade pip
+          python -m pip install requests matplotlib
 
-          def fail(message):
-              print("ERROR:", message)
-              sys.exit(1)
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
-          key = os.environ.get("GEMINI_API_KEY", "").strip()
-          model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-
-          if not key:
-              fail("GEMINI_API_KEY secret is missing.")
-
-          try:
-              r = requests.get(
-                  "https://api.coingecko.com/api/v3/coins/markets",
-                  params={
-                      "vs_currency": "usd",
-                      "ids": "bitcoin,ethereum,binancecoin,solana",
-                      "price_change_percentage": "24h"
-                  },
-                  timeout=25
-              )
-              r.raise_for_status()
-              coins = r.json()
-          except Exception as e:
-              fail("Market data request failed: " + str(e))
-
-          if not isinstance(coins, list) or len(coins) < 3:
-              fail("Market data is incomplete.")
-
-          rows = []
-          for c in coins:
-              price = c.get("current_price")
-              change = c.get("price_change_percentage_24h")
-              volume = c.get("total_volume")
-              if price is None or change is None:
-                  continue
-              rows.append(
-                  f"{c.get('name')} ({c.get('symbol', '').upper()}): "
-                  f"${price}, 24h change {change:.2f}%, "
-                  f"volume ${volume}"
-              )
-
-          if len(rows) < 3:
-              fail("Not enough valid market data.")
-
-          market = "\n".join(rows)
-          url = (
-              "https://generativelanguage.googleapis.com/"
-              f"v1beta/models/{model}:generateContent"
-          )
-
-          prompt = f"""
-          Write an original Binance Square crypto market post in English.
-          Target length: 600 to 900 characters, excluding no content.
-          Include a clear title, market analysis based only on the data,
-          what traders should watch, a risk warning, and 3 relevant hashtags.
-          Use short paragraphs. Do not invent news or indicators.
-          Never promise profits. Return only the complete post text.
-
-          MARKET DATA:
-          {market}
-          """
-
-          text = ""
-          for attempt in range(2):
-              try:
-                  r = requests.post(
-                      url,
-                      headers={
-                          "x-goog-api-key": key,
-                          "Content-Type": "application/json"
-                      },
-                      json={
-                          "contents": [{
-                              "parts": [{"text": prompt}]
-                          }],
-                          "generationConfig": {
-                              "temperature": 0.7,
-                              "maxOutputTokens": 900
-                          }
-                      },
-                      timeout=60
-                  )
-
-                  if not r.ok:
-                      fail(
-                          f"Gemini API HTTP {r.status_code}: "
-                          + r.text[:1000]
-                      )
-
-                  data = r.json()
-                  text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-              except SystemExit:
-                  raise
-              except Exception as e:
-                  fail("Gemini generation failed: " + str(e))
-
-              if len(text) >= 300:
-                  break
-
-              prompt = f"""
-              Your previous response was too short.
-              Write a complete original English crypto market post
-              between 600 and 900 characters. Include a title,
-              analysis of the supplied data, trader watchpoints,
-              a risk warning, and 3 hashtags.
-              Do not invent facts or promise profits.
-              Return only the post text.
-
-              MARKET DATA:
-              {market}
-              """
-
-          if len(text) < 80:
-              fail(
-                  f"Generated text is too short ({len(text)} characters)."
-              )
-
-          if len(text) > 2000:
-              fail("Generated post exceeds 2000 characters.")
-
-          os.makedirs("out", exist_ok=True)
-          with open("out/post.txt", "w", encoding="utf-8") as f:
-              f.write(text)
-          with open("out/market-data.txt", "w", encoding="utf-8") as f:
-              f.write(market)
-
-          print("Post generated successfully.")
-          print("Character count:", len(text))
-          print(text)
-          PY
-
-      - name: Publish to Binance Square
-        if: ${{ github.event_name == 'schedule' || inputs.post_mode == 'live' }}
-        env:
-          BINANCE_SQUARE_OPENAPI_KEY: ${{ secrets.BINANCE_SQUARE_OPENAPI_KEY }}
+      - name: Download Binance Square posting skill
         run: |
-          python - <<'PY'
-          import os
-          import sys
-          import requests
+          git clone --depth 1 \
+            https://github.com/binance/binance-skills-hub.git \
+            /tmp/binance-skills
 
-          key = os.environ.get(
-              "BINANCE_SQUARE_OPENAPI_KEY", ""
-          ).strip()
+          echo "Checking image posting script..."
+          find /tmp/binance-skills \
+            -path '*/post-image.mjs' -print
 
-          if not key:
-              sys.exit("BINANCE_SQUARE_OPENAPI_KEY secret is missing.")
+      - name: Validate required API secret
+        run: |
+          if [ -z "$BINANCE_SQUARE_OPENAPI_KEY" ]; then
+            echo "::error::Missing BINANCE_SQUARE_OPENAPI_KEY secret"
+            exit 1
+          fi
 
-          with open("out/post.txt", encoding="utf-8") as f:
-              post_text = f.read().strip()
+      - name: Build analysis and publish post
+        run: python bot.py
 
-          url = (
-              "https://www.binance.com/bapi/composite/v1/"
-              "public/pgc/openApi/content/add"
-          )
-
-          try:
-              r = requests.post(
-                  url,
-                  headers={
-                      "Content-Type": "application/json",
-                      "clienttype": "binanceSkill",
-                      "X-Square-OpenAPI-Key": key
-                  },
-                  json={"bodyTextOnly": post_text},
-                  timeout=30
-              )
-              print("Binance HTTP status:", r.status_code)
-              r.raise_for_status()
-              result = r.json()
-          except Exception as e:
-              sys.exit("Binance publishing request failed: " + str(e))
-
-          if str(result.get("code")) != "000000":
-              sys.exit("Binance rejected the post: " + str(result)[:1200])
-
-          print("Binance Square accepted the post.")
-          print("Response:", result)
-          PY
-
-      - name: Save generated post artifact
+      - name: Save post and chart for inspection
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: generated-binance-post
+          name: square-post-${{ github.run_number }}
           path: out/
-          if-no-files-found: warn
-          retention-days: 7
+          if-no-files-found: ignore
+          retention-days: 14
